@@ -395,6 +395,20 @@ class KloudStack_Migration_BackgroundExport {
         // Sub-directories to exclude when scanning WP_CONTENT_DIR root.
         $excluded_subdirs = [ 'plugins', 'themes', 'uploads', 'mu-plugins', 'languages', 'upgrade' ];
 
+        // WordPress drop-in files are environment-specific: they contain connection
+        // credentials, paths, and configuration for the SOURCE server.  Copying them
+        // to the target stack causes PHP fatal errors (e.g. W3TC's db.php calling
+        // wp_get_wp_version() before WordPress has finished bootstrapping).
+        // Exclude them here — caching plugins will regenerate correct drop-ins for
+        // the target environment when they are re-enabled after migration.
+        $excluded_root_files = [
+            'db.php',
+            'advanced-cache.php',
+            'object-cache.php',
+            'db-error.php',
+            'maintenance.php',
+        ];
+
         $tmp_zip = tempnam( sys_get_temp_dir(), 'ks_content_' ) . '.zip';
 
         try {
@@ -441,6 +455,9 @@ class KloudStack_Migration_BackgroundExport {
                         continue;
                     }
                     // Root-level file.
+                    if ( in_array( $file->getFilename(), $excluded_root_files, true ) ) {
+                        continue;
+                    }
                     if ( $skip_extensions ) {
                         $ext = strtolower( pathinfo( $file->getFilename(), PATHINFO_EXTENSION ) );
                         if ( in_array( '.' . $ext, $skip_extensions, true ) || in_array( $ext, $skip_extensions, true ) ) {
