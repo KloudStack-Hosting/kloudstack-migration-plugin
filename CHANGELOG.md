@@ -2,6 +2,14 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.4.0] - 2026-06-05
+
+### Changed
+- **DB export: plain SQL stream, no gzip**: `BackgroundExport::_run_db_export()` now streams the `mysqldump` output directly to Azure Blob Storage as uncompressed SQL (`dump.sql`). The `gzip` pipe, temp `.sql.gz` file, and pre-upload gzip integrity check have been removed. Eliminates the CPU spike from compression on shared hosting accounts where MySQL/MariaDB runs locally on the same server.
+- **`--quick` flag added to mysqldump**: Reads one row at a time rather than buffering the entire table in memory — reduces RAM usage on constrained shared hosting accounts.
+- **`gzip_level` hint replaced with `stream_rate_limit_kbps`**: The agent can now throttle the mysqldump pipe rate (via `pv` if available) when CPU is elevated, instead of adjusting compression level. Falls back gracefully if `pv` is not installed.
+- **MIME type updated**: Blob upload content type changed from `application/gzip` to `application/octet-stream`.
+
 ## [1.3.0] - 2026-03-24
 
 ### Added
