@@ -324,7 +324,7 @@ class KloudStack_Migration_RestEndpoints {
         $params  = $request->get_json_params();
         $sas_url = sanitize_url( $params['sas_url'] ?? '' );
 
-        // Agent-provided hints for this attempt (e.g. reduced gzip_level after a CPU timeout).
+        // Agent-provided hints for this attempt (e.g. stream_rate_limit_kbps after a CPU spike).
         // Stored in the job transient so BackgroundExport can apply them when it runs.
         $hints = self::_sanitize_hints( $params['hints'] ?? [] );
 
@@ -864,9 +864,9 @@ class KloudStack_Migration_RestEndpoints {
         }
         $hints = [];
 
-        // gzip compression level — lower = less CPU, larger file
-        if ( isset( $raw['gzip_level'] ) ) {
-            $hints['gzip_level'] = max( 1, min( 9, (int) $raw['gzip_level'] ) );
+        // Stream rate limit for mysqldump pipe (kbps) — throttles DB export when CPU is high
+        if ( isset( $raw['stream_rate_limit_kbps'] ) ) {
+            $hints['stream_rate_limit_kbps'] = max( 128, (int) $raw['stream_rate_limit_kbps'] );
         }
 
         // File extensions to skip during media ZIP (e.g. large video files)

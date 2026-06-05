@@ -9,9 +9,9 @@
  *   queued → processing → complete | failed
  *
  * DB export:
- *   1. Shell-out to mysqldump (respects WP DB constants)
- *   2. Gzip the output (inline pipe to save disk space)
- *   3. Upload the gzipped dump to Azure Blob via SAS PUT request
+ *   1. Shell-out to mysqldump --single-transaction --quick (respects WP DB constants)
+ *   2. Write raw SQL to a temp file (no gzip — avoids CPU spike on shared hosting)
+ *   3. Upload the SQL dump to Azure Blob via SAS PUT request
  *   4. Update job transient → complete
  *
  * Media upload:
@@ -126,7 +126,7 @@ class KloudStack_Migration_BackgroundExport {
 
                 // Load agent-provided hints stored when the job was queued.
                 // On retries after a failure the backend may include adjusted parameters
-                // (e.g. lower gzip_level after a CPU timeout or skip_extensions after an OOM).
+                // (e.g. stream_rate_limit_kbps after a CPU spike or skip_extensions after an OOM).
                 $job_transient = get_transient( KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id );
                 $hints = ( is_array( $job_transient ) && isset( $job_transient['hints'] ) && is_array( $job_transient['hints'] ) )
                     ? $job_transient['hints']
@@ -173,10 +173,11 @@ class KloudStack_Migration_BackgroundExport {
     // ------------------------------------------------------------------
 
     /**
-     * Export the WordPress database to a gzipped dump and upload to Azure Blob.
+     * Export the WordPress database to a plain SQL dump and upload to Azure Blob.
      *
-     * Uses mysqldump piped through gzip, writing to a temp file, then
-     * uploads via HTTP PUT to the SAS URL.
+     * Streams mysqldump output to a temp file without gzip compression.
+     * --single-transaction avoids table locks on InnoDB (zero impact on the live site).
+     * --quick reads one row at a time, keeping memory usage minimal on shared hosting.
      *
      * @param string $job_id
      * @param string $sas_url  Must be HTTPS
@@ -192,14 +193,17 @@ class KloudStack_Migration_BackgroundExport {
             throw new Exception( 'Database export requires exec() which is not available on this server. Contact your hosting provider.' );
         }
 
-        // Apply agent hint for compression level. Default is 4 (balanced CPU/size).
-        // On retry after a CPU timeout the agent may set this to 1 (fastest, larger file).
-        $gzip_level = isset( $hints['gzip_level'] ) ? max( 1, min( 9, (int) $hints['gzip_level'] ) ) : 4;
+        // Apply optional stream rate limit hint (kbps). When the agent detects high CPU
+        // during export it may set stream_rate_limit_kbps to throttle the mysqldump pipe.
+        $rate_limit_kbps = isset( $hints['stream_rate_limit_kbps'] ) ? max( 128, (int) $hints['stream_rate_limit_kbps'] ) : 0;
 
-        $tmp_file = tempnam( sys_get_temp_dir(), 'ks_db_' ) . '.sql.gz';
+        $tmp_file = tempnam( sys_get_temp_dir(), 'ks_db_' ) . '.sql';
 
         try {
-            // Build mysqldump command with individual argument escaping
+            // Build mysqldump command with individual argument escaping.
+            // --single-transaction: InnoDB snapshot — zero table locking, invisible to other connections.
+            // --quick: reads one row at a time — minimal RAM on restricted shared hosting accounts.
+            // --routines --triggers --add-drop-table: full schema + data export.
             $host     = escapeshellarg( DB_HOST );
             $user     = escapeshellarg( DB_USER );
             $database = escapeshellarg( DB_NAME );
@@ -208,13 +212,25 @@ class KloudStack_Migration_BackgroundExport {
             // DB_PASSWORD is passed via env var to avoid appearing on process list
             putenv( 'MYSQL_PWD=' . DB_PASSWORD );
 
-            // Use bash with pipefail so the pipeline exit code reflects mysqldump
-            // failures — without this, exec() only returns gzip's exit code.
-            // gzip stderr goes to /dev/null to prevent error messages from being
-            // appended to the .gz output (which would corrupt the gzip format).
-            $cmd = "bash -c 'set -o pipefail; mysqldump --host={$host} --user={$user} --single-transaction "
-                 . "--routines --triggers --add-drop-table {$database} "
-                 . "| gzip -{$gzip_level} > {$tmp_esc} 2>/dev/null'";
+            if ( $rate_limit_kbps > 0 ) {
+                // pv throttles the byte rate of the pipe when a CPU limit hint is active.
+                // Falls back gracefully if pv is not installed (most shared hosts lack it).
+                $pv_available = ! empty( shell_exec( 'which pv 2>/dev/null' ) );
+                if ( $pv_available ) {
+                    $rate_arg = escapeshellarg( $rate_limit_kbps . 'k' );
+                    $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
+                         . "--quick --routines --triggers --add-drop-table {$database} "
+                         . "| pv -q -L {$rate_arg} > {$tmp_esc} 2>/dev/null'";
+                } else {
+                    $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
+                         . "--quick --routines --triggers --add-drop-table {$database} "
+                         . "> {$tmp_esc} 2>/dev/null'";
+                }
+            } else {
+                $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
+                     . "--quick --routines --triggers --add-drop-table {$database} "
+                     . "> {$tmp_esc} 2>/dev/null'";
+            }
 
             $output    = [];
             $exit_code = 0;
@@ -224,27 +240,17 @@ class KloudStack_Migration_BackgroundExport {
             putenv( 'MYSQL_PWD=' );
 
             if ( 0 !== $exit_code ) {
-                throw new Exception( 'mysqldump | gzip pipeline failed (exit=' . $exit_code . '): ' . implode( ' ', $output ) );
+                throw new Exception( 'mysqldump failed (exit=' . $exit_code . '): ' . implode( ' ', $output ) );
             }
 
             if ( ! file_exists( $tmp_file ) || 0 === filesize( $tmp_file ) ) {
                 throw new Exception( 'mysqldump produced empty output.' );
             }
 
-            // Verify gzip integrity before uploading — catches truncated dumps from
-            // interrupted mysqldump or gzip processes (e.g. PHP timeout, OOM kill).
-            $gzip_check_output = [];
-            $gzip_check_exit   = 0;
-            exec( "gzip -t {$tmp_esc} 2>&1", $gzip_check_output, $gzip_check_exit );
-            if ( 0 !== $gzip_check_exit ) {
-                $gzip_error = implode( ' ', $gzip_check_output );
-                throw new Exception( "DB dump gzip integrity check failed before upload — file is truncated or corrupt: {$gzip_error}" );
-            }
-
             self::_update_job( $job_id, [ 'progress' => 70 ] );
 
-            // Upload to Azure Blob via SAS PUT
-            self::_upload_file_to_blob( $sas_url, $tmp_file, 'application/gzip' );
+            // Upload plain SQL to Azure Blob via SAS PUT
+            self::_upload_file_to_blob( $sas_url, $tmp_file, 'application/octet-stream' );
 
             self::_update_job( $job_id, [ 'progress' => 100 ] );
             return true;
