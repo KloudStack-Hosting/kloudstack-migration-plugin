@@ -440,8 +440,8 @@ class KloudStack_Migration_BackgroundExport {
             'total_bytes'  => $total_bytes,
             'completed_at' => time(),
         ] );
-        $manifest_url = "{$container_base_url}/{$blob_prefix}/../{$GLOBALS['_ks_manifest_name'] ?? '_manifest.json'}?{$sas_token}";
-        // Build the manifest blob URL cleanly without relying on path traversal.
+        // Build the manifest blob URL — strip /uploads suffix from the prefix so
+        // the manifest lands at the container root for that migration, not inside /uploads.
         $media_base   = preg_replace( '#/uploads$#', '', $blob_prefix );
         $manifest_url = "{$container_base_url}/{$media_base}/_manifest.json?{$sas_token}";
 
