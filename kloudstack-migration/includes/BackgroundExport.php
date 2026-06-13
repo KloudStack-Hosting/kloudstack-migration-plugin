@@ -2,7 +2,7 @@
 /**
  * KloudStack Migration — Background Export Engine
  *
- * Manages async jobs for DB dump and media ZIP creation + Azure Blob upload.
+ * Manages async jobs for DB dump and per-file media upload to Azure Blob Storage.
  * Uses WP-Cron for scheduling: process_queue() runs every 60 seconds.
  *
  * Job lifecycle:
@@ -14,15 +14,23 @@
  *   3. Upload the SQL dump to Azure Blob via SAS PUT request
  *   4. Update job transient → complete
  *
- * Media upload:
- *   1. Create a ZIP archive of wp-content/uploads/*
- *   2. Stream upload to Azure Blob via SAS PUT request using chunked transfer
+ * Media upload (per-file streaming — Sprint M):
+ *   1. Enumerate all files in wp-content/uploads/ recursively
+ *   2. For each file: cURL PUT directly to Azure Blob using a container-level SAS token
+ *      — no ZIP, no /tmp disk usage, no compression
+ *   3. Track uploaded files in the job transient for resume-on-retry (checkpointed)
+ *   4. After all files: upload a _manifest.json blob to signal completion
+ *   5. Update job transient → complete
+ *
+ * Content export (plugins / themes / mu-plugins / custom-root):
+ *   1. Create a ZIP archive of the source directory
+ *   2. Stream upload to Azure Blob via SAS PUT request
  *   3. Update job transient → complete
  *
  * Security:
  *   - mysqldump credentials taken from WP_DB_* constants (never user input)
  *   - Command arguments individually escaped with escapeshellarg()
- *   - SAS URLs validated to be HTTPS before use
+ *   - SAS URLs and SAS tokens validated to be HTTPS / Azure Blob endpoints before use
  *   - Temp files created in sys_get_temp_dir() with unique names and deleted after use
  *
  * @package KloudStackMigration
@@ -139,7 +147,13 @@ class KloudStack_Migration_BackgroundExport {
                 try {
                     if ( 'db_export' === $type ) {
                         $success = self::_run_db_export( $job_id, $sas_url, $hints );
+                    } elseif ( 'media_stream' === $type ) {
+                        $container_base_url = $item['container_base_url'] ?? '';
+                        $blob_prefix        = $item['blob_prefix'] ?? '';
+                        $sas_token          = $item['sas_token'] ?? '';
+                        $success = self::_run_media_stream( $job_id, $container_base_url, $blob_prefix, $sas_token, $hints );
                     } elseif ( 'media_upload' === $type ) {
+                        // Legacy job type — kept for any jobs queued before Sprint M.
                         $success = self::_run_media_upload( $job_id, $sas_url, $hints );
                     } elseif ( 'content_export' === $type ) {
                         $source_path = $item['source_path'] ?? '';
@@ -265,11 +279,198 @@ class KloudStack_Migration_BackgroundExport {
     }
 
     // ------------------------------------------------------------------
-    // Media Upload
+    // Media Stream — per-file direct Blob PUT (Sprint M)
+    // ------------------------------------------------------------------
+
+    /**
+     * Stream every file in wp-content/uploads/ directly to Azure Blob Storage.
+     *
+     * Each file is PUT individually using a container-level SAS token — no ZIP,
+     * no temp disk usage. The job transient tracks uploaded files so that a
+     * retry/WP-Cron resumption skips already-completed files (checkpointing).
+     *
+     * A _manifest.json blob is uploaded as the final step to signal completion.
+     *
+     * @param string $job_id
+     * @param string $container_base_url  e.g. https://{account}.blob.core.windows.net/kloudstack-migrations
+     * @param string $blob_prefix         e.g. migrations/{id}/media/uploads
+     * @param string $sas_token           Container-level write SAS (no leading '?')
+     * @param array  $hints               Agent-provided hints (skip_extensions, max_file_size_mb)
+     * @return bool  true when all files uploaded and manifest written
+     * @throws Exception on unrecoverable upload failure
+     */
+    private static function _run_media_stream(
+        string $job_id,
+        string $container_base_url,
+        string $blob_prefix,
+        string $sas_token,
+        array $hints = []
+    ): bool {
+        // Validate the container base URL points to Azure Blob Storage over HTTPS.
+        if ( 0 !== strpos( $container_base_url, 'https://' ) ) {
+            throw new Exception( 'container_base_url must use HTTPS.' );
+        }
+        if ( false === strpos( parse_url( $container_base_url, PHP_URL_HOST ) ?? '', '.blob.core.windows.net' ) ) {
+            throw new Exception( 'container_base_url host is not a trusted Azure Blob endpoint.' );
+        }
+
+        $uploads_dir = wp_upload_dir();
+        $base_dir    = $uploads_dir['basedir'];
+
+        if ( ! is_dir( $base_dir ) ) {
+            throw new Exception( "Uploads directory not found: {$base_dir}" );
+        }
+
+        // Agent hints.
+        $skip_extensions = isset( $hints['skip_extensions'] ) && is_array( $hints['skip_extensions'] )
+            ? array_map( 'strtolower', $hints['skip_extensions'] )
+            : [];
+        $max_size_bytes = isset( $hints['max_file_size_mb'] ) && $hints['max_file_size_mb'] > 0
+            ? ( (int) $hints['max_file_size_mb'] ) * 1024 * 1024
+            : 0;
+
+        // Batch size: number of files processed per WP-Cron tick.
+        // Keeps each execution under ~8 minutes on slow shared hosting
+        // (500 files × ~100 ms/HTTPS PUT = ~50 s, well within safe limits).
+        $batch_size = 500;
+
+        // Load checkpoint — list of relative paths already uploaded this job.
+        $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
+        $job_data      = get_transient( $transient_key );
+        $uploaded      = isset( $job_data['uploaded_files'] ) && is_array( $job_data['uploaded_files'] )
+            ? $job_data['uploaded_files']
+            : [];
+        $uploaded_set  = array_flip( $uploaded ); // O(1) lookups
+
+        // Build the full file list (only built once; subsequent batches use transient offset).
+        $all_files = [];
+        $iterator  = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $base_dir, FilesystemIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+        foreach ( $iterator as $file ) {
+            if ( ! $file->isFile() ) {
+                continue;
+            }
+            if ( $skip_extensions ) {
+                $ext = strtolower( pathinfo( $file->getFilename(), PATHINFO_EXTENSION ) );
+                if ( in_array( '.' . $ext, $skip_extensions, true ) || in_array( $ext, $skip_extensions, true ) ) {
+                    continue;
+                }
+            }
+            if ( $max_size_bytes > 0 && $file->getSize() > $max_size_bytes ) {
+                continue;
+            }
+            $all_files[] = [
+                'abs'  => $file->getPathname(),
+                'rel'  => str_replace( $base_dir . DIRECTORY_SEPARATOR, '', $file->getPathname() ),
+                'size' => $file->getSize(),
+            ];
+        }
+
+        $total_files = count( $all_files );
+        $total_bytes = array_sum( array_column( $all_files, 'size' ) );
+
+        // Update totals in transient so the polling loop can display accurate counts.
+        self::_update_job( $job_id, [
+            'total_files'  => $total_files,
+            'total_bytes'  => $total_bytes,
+        ] );
+
+        $files_this_batch = 0;
+
+        foreach ( $all_files as $entry ) {
+            $rel_path = $entry['rel'];
+
+            // Skip files already uploaded (checkpointing — safe to resume after PHP-FPM kill).
+            if ( isset( $uploaded_set[ $rel_path ] ) ) {
+                continue;
+            }
+
+            // Normalise path separators to forward-slash for the blob name.
+            $blob_rel  = str_replace( DIRECTORY_SEPARATOR, '/', $rel_path );
+            $blob_name = "{$blob_prefix}/{$blob_rel}";
+            $blob_url  = "{$container_base_url}/{$blob_name}?{$sas_token}";
+
+            // Detect MIME type for accurate Content-Type header.
+            $mime_type = 'application/octet-stream';
+            if ( function_exists( 'mime_content_type' ) ) {
+                $detected = mime_content_type( $entry['abs'] );
+                if ( $detected ) {
+                    $mime_type = $detected;
+                }
+            }
+
+            self::_upload_blob_put( $blob_url, $entry['abs'], $mime_type );
+
+            // Record as uploaded in checkpoint.
+            $uploaded[]              = $rel_path;
+            $uploaded_set[$rel_path] = true;
+            $files_this_batch++;
+
+            // Persist checkpoint and progress after each file.
+            $progress = $total_files > 0
+                ? min( 99, (int) ( count( $uploaded ) / $total_files * 99 ) )
+                : 99;
+            self::_update_job( $job_id, [
+                'progress'       => $progress,
+                'files_uploaded' => count( $uploaded ),
+                'bytes_uploaded' => array_sum(
+                    array_map(
+                        fn( $r ) => $all_files[ array_search( $r, array_column( $all_files, 'rel' ), true ) ]['size'] ?? 0,
+                        $uploaded
+                    )
+                ),
+                'uploaded_files' => $uploaded,
+            ] );
+
+            // Yield after the batch limit to allow WP-Cron to reschedule.
+            if ( $files_this_batch >= $batch_size ) {
+                // Mark job as still processing (not failed) and exit cleanly.
+                // WP-Cron will re-enqueue this job on the next tick and resume
+                // from the checkpoint transient.
+                self::_update_job( $job_id, [ 'status' => 'processing' ] );
+                return false; // Returning false re-queues the item for the next cron tick.
+            }
+        }
+
+        // All files uploaded — write _manifest.json as the completion signal.
+        $manifest = json_encode( [
+            'total_files'  => $total_files,
+            'total_bytes'  => $total_bytes,
+            'completed_at' => time(),
+        ] );
+        $manifest_url = "{$container_base_url}/{$blob_prefix}/../{$GLOBALS['_ks_manifest_name'] ?? '_manifest.json'}?{$sas_token}";
+        // Build the manifest blob URL cleanly without relying on path traversal.
+        $media_base   = preg_replace( '#/uploads$#', '', $blob_prefix );
+        $manifest_url = "{$container_base_url}/{$media_base}/_manifest.json?{$sas_token}";
+
+        $tmp_manifest = tempnam( sys_get_temp_dir(), 'ks_manifest_' ) . '.json';
+        try {
+            file_put_contents( $tmp_manifest, $manifest );
+            self::_upload_blob_put( $manifest_url, $tmp_manifest, 'application/json' );
+        } finally {
+            if ( file_exists( $tmp_manifest ) ) {
+                unlink( $tmp_manifest );
+            }
+        }
+
+        self::_update_job( $job_id, [
+            'progress'       => 100,
+            'files_uploaded' => $total_files,
+            'bytes_uploaded' => $total_bytes,
+        ] );
+
+        return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Media Upload — legacy ZIP approach (kept for backward compat)
     // ------------------------------------------------------------------
 
     /**
      * Create a ZIP of wp-content/uploads and upload to Azure Blob.
+     * Kept for any jobs queued before Sprint M. New jobs use _run_media_stream().
      *
      * @param string $job_id
      * @param string $sas_url  Must be HTTPS
@@ -522,21 +723,22 @@ class KloudStack_Migration_BackgroundExport {
     }
 
     // ------------------------------------------------------------------
-    // Azure Blob upload helper
+    // Azure Blob upload helpers
     // ------------------------------------------------------------------
 
     /**
      * Upload a local file to an Azure Blob using a SAS PUT URL.
      *
-     * Uses wp_remote_request with chunked streaming to handle large files
-     * without exhausting PHP memory.
+     * Includes x-ms-version (unlocks 5 GB single PUT), x-ms-blob-content-md5
+     * (Azure verifies integrity on ingest), and accurate Content-Type per file.
+     * Uses cURL streaming PUT to avoid loading the file into PHP memory.
      *
-     * @param string $sas_url    Must be HTTPS
+     * @param string $sas_url    Full blob SAS URL (must be HTTPS)
      * @param string $local_path Full filesystem path to the file
      * @param string $mime_type  MIME type for Content-Type header
      * @throws Exception on upload failure
      */
-    private static function _upload_file_to_blob( string $sas_url, string $local_path, string $mime_type ): void {
+    private static function _upload_blob_put( string $sas_url, string $local_path, string $mime_type ): void {
         $file_size = filesize( $local_path );
         $fh        = fopen( $local_path, 'rb' );
 
@@ -545,10 +747,10 @@ class KloudStack_Migration_BackgroundExport {
         }
 
         try {
-            // Use cURL streaming PUT to avoid loading the entire file into memory.
-            // wp_remote_request() passes the body as a string (file_get_contents)
-            // which OOMs on large DB dumps / media ZIPs on Azure App Service
-            // (default memory_limit is 128 MB).
+            // Compute MD5 for server-side integrity verification.
+            // Azure rejects the PUT with HTTP 400 if the hash doesn't match.
+            $md5_b64 = base64_encode( hash_file( 'md5', $local_path, true ) );
+
             $ch = curl_init( $sas_url );
             curl_setopt_array( $ch, [
                 CURLOPT_PUT            => true,
@@ -559,7 +761,9 @@ class KloudStack_Migration_BackgroundExport {
                 CURLOPT_HTTPHEADER     => [
                     'Content-Type: ' . $mime_type,
                     'x-ms-blob-type: BlockBlob',
-                    'Expect:',  // Suppress 100-Continue handshake delay with Azure
+                    'x-ms-version: 2021-06-08',     // unlocks 5 GB single PUT limit
+                    'x-ms-blob-content-md5: ' . $md5_b64,
+                    'Expect:',                       // suppress 100-Continue delay with Azure
                 ],
             ] );
 
@@ -578,6 +782,14 @@ class KloudStack_Migration_BackgroundExport {
         } finally {
             fclose( $fh );
         }
+    }
+
+    /**
+     * Backward-compat wrapper used by _run_db_export and _run_content_export.
+     * Delegates to _upload_blob_put — kept so callers don't need updating.
+     */
+    private static function _upload_file_to_blob( string $sas_url, string $local_path, string $mime_type ): void {
+        self::_upload_blob_put( $sas_url, $local_path, $mime_type );
     }
 
     // ------------------------------------------------------------------

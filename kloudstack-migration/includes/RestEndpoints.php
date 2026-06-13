@@ -396,7 +396,20 @@ class KloudStack_Migration_RestEndpoints {
             );
         }
 
-        return new WP_REST_Response( array_merge( $job, [ 'job_id' => $job_id ] ), 200 );
+        // Expose rich progress fields for media_stream jobs; omit the uploaded_files
+        // checkpoint array (can be large) and the raw sas_token from the response.
+        $safe_fields = [
+            'job_id', 'type', 'status', 'progress', 'error', 'created_at',
+            'files_uploaded', 'total_files', 'bytes_uploaded', 'total_bytes',
+            'artifact', 'blob_path', 'message',
+        ];
+        $response = [ 'job_id' => $job_id ];
+        foreach ( $safe_fields as $field ) {
+            if ( array_key_exists( $field, $job ) ) {
+                $response[ $field ] = $job[ $field ];
+            }
+        }
+        return new WP_REST_Response( $response, 200 );
     }
 
     // ------------------------------------------------------------------
@@ -404,43 +417,80 @@ class KloudStack_Migration_RestEndpoints {
     // ------------------------------------------------------------------
 
     /**
-     * Start an async media ZIP creation + upload to the provided SAS URL.
+     * Start an async per-file media upload to Azure Blob Storage (Sprint M).
+     *
+     * Accepts a container-level write SAS token rather than a single blob SAS URL.
+     * The plugin streams each file in wp-content/uploads/ directly to Azure Blob —
+     * no ZIP archive, no temp disk usage.
+     *
+     * Request body:
+     *   {
+     *     "container_base_url": "https://{account}.blob.core.windows.net/kloudstack-migrations",
+     *     "blob_prefix":        "migrations/{id}/media/uploads",
+     *     "sas_token":          "<container write SAS — no leading ?>",
+     *     "hints":              { ... }  // optional
+     *   }
      *
      * @param WP_REST_Request $request
      * @return WP_REST_Response
      */
     public static function upload_media( WP_REST_Request $request ): WP_REST_Response {
-        $params  = $request->get_json_params();
-        $sas_url = sanitize_url( $params['sas_url'] ?? '' );
+        $params             = $request->get_json_params();
+        $container_base_url = sanitize_url( $params['container_base_url'] ?? '' );
+        $blob_prefix        = sanitize_text_field( $params['blob_prefix'] ?? '' );
+        $sas_token          = sanitize_text_field( $params['sas_token'] ?? '' );
 
-        // Agent-provided hints (e.g. skip large video files that caused timeouts).
+        if ( empty( $container_base_url ) || empty( $blob_prefix ) || empty( $sas_token ) ) {
+            return new WP_REST_Response(
+                [ 'error' => 'container_base_url, blob_prefix, and sas_token are required.' ],
+                400
+            );
+        }
+
+        // Agent-provided hints (e.g. skip_extensions after a timeout on large files).
         $hints = self::_sanitize_hints( $params['hints'] ?? [] );
 
         $job_id = 'media_' . wp_generate_uuid4();
 
         $job = [
-            'type'       => 'media_upload',
-            'status'     => 'queued',
-            'progress'   => 0,
-            'sas_url'    => $sas_url,
-            'hints'      => $hints,
-            'created_at' => time(),
-            'error'      => null,
+            'type'               => 'media_stream',
+            'status'             => 'queued',
+            'progress'           => 0,
+            'files_uploaded'     => 0,
+            'total_files'        => 0,
+            'bytes_uploaded'     => 0,
+            'total_bytes'        => 0,
+            'uploaded_files'     => [],   // checkpoint — relative paths already uploaded
+            'container_base_url' => $container_base_url,
+            'blob_prefix'        => $blob_prefix,
+            'sas_token'          => $sas_token,
+            'hints'              => $hints,
+            'created_at'         => time(),
+            'error'              => null,
         ];
 
         set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
 
-        // Enqueue into BackgroundExport queue
-        KloudStack_Migration_BackgroundExport::enqueue( $job_id, 'media_upload', $sas_url );
+        KloudStack_Migration_BackgroundExport::enqueue(
+            $job_id,
+            'media_stream',
+            '',  // sas_url unused for media_stream — real params in extra_data
+            [
+                'container_base_url' => $container_base_url,
+                'blob_prefix'        => $blob_prefix,
+                'sas_token'          => $sas_token,
+            ]
+        );
 
-        // Run process_queue() after the 202 response is sent — same approach as export_db.
-        // Loopback WP-Cron kicks are unreliable on Azure App Service + Front Door.
+        // Flush the 202 response, then process immediately in this PHP-FPM worker.
+        // Large media libraries require multiple WP-Cron ticks to complete (checkpointing).
+        // set_time_limit covers one batch (~500 files × ~100 ms = ~50 s) with headroom.
         register_shutdown_function( function () {
             if ( function_exists( 'fastcgi_finish_request' ) ) {
                 fastcgi_finish_request();
             }
             ignore_user_abort( true );
-            set_time_limit( 600 ); // Allow up to 10 min for large media archives
+            set_time_limit( 300 );
             KloudStack_Migration_BackgroundExport::process_queue();
         } );
 
@@ -878,7 +928,7 @@ class KloudStack_Migration_RestEndpoints {
             );
         }
 
-        // Maximum individual file size to include in media ZIP (0 = no limit)
+        // Maximum individual file size to include in media export (0 = no limit)
         if ( isset( $raw['max_file_size_mb'] ) ) {
             $hints['max_file_size_mb'] = max( 0, (int) $raw['max_file_size_mb'] );
         }
