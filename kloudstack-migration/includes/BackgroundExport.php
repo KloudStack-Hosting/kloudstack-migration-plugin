@@ -45,8 +45,11 @@ class KloudStack_Migration_BackgroundExport {
     const CRON_HOOK    = 'kloudstack_process_export_queue';
     const QUEUE_OPTION = 'kloudstack_export_queue';
 
-    // Max concurrent jobs processed per cron tick
-    const MAX_JOBS_PER_RUN = 1;
+    // Max jobs processed per cron tick / shutdown call.
+    // Set high enough to drain all content_export jobs (plugins + themes + mu-plugins)
+    // in a single pass — critical for hosts with DISABLE_WP_CRON=true where only one
+    // shutdown-function invocation fires and WP-Cron never picks up remaining jobs.
+    const MAX_JOBS_PER_RUN = 10;
 
     // Chunk size for streaming upload: 4 MB
     const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
