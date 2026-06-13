@@ -389,6 +389,23 @@ class KloudStack_Migration_RestEndpoints {
         $job    = get_transient( self::JOB_TRANSIENT_PREFIX . $job_id );
 
         if ( false === $job ) {
+            // Transient may have been evicted by a shared hosting object cache (e.g. GoDaddy
+            // Memcached under memory pressure) even within the 24-hour TTL. Before returning
+            // 404, check whether the job is still in the persistent queue (wp_options) — if
+            // so, it hasn't run yet and we can synthesise a safe "queued" response so the
+            // server-side poller keeps waiting rather than failing the migration.
+            $queue = get_option( KloudStack_Migration_BackgroundExport::QUEUE_OPTION, [] );
+            foreach ( $queue as $item ) {
+                if ( ( $item['job_id'] ?? '' ) === $job_id ) {
+                    return new WP_REST_Response( [
+                        'job_id'   => $job_id,
+                        'type'     => $item['type'] ?? 'unknown',
+                        'status'   => 'queued',
+                        'progress' => 0,
+                        'message'  => 'Job is queued and waiting to process.',
+                    ], 200 );
+                }
+            }
             return new WP_Error(
                 'not_found',
                 "Job {$job_id} not found or expired.",
