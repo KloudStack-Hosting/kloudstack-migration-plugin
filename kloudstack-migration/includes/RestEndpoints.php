@@ -835,11 +835,10 @@ class KloudStack_Migration_RestEndpoints {
         $media_minutes = max( 1, ceil( $media_file_count / 500 ) );
         $estimated_export_minutes = $db_minutes + $media_minutes;
 
-        // Blockers — conditions that will cause export to fail without intervention
+        // Blockers — conditions that will cause export to fail without intervention.
+        // Note: exec_disabled is NOT a blocker — _run_db_export() falls back to
+        // PHP-native wpdb export automatically when exec() is unavailable.
         $blockers = [];
-        if ( ! $exec_available ) {
-            $blockers[] = 'exec_disabled';
-        }
         if ( ! class_exists( 'ZipArchive' ) ) {
             $blockers[] = 'ziparchive_missing';
         }

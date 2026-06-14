@@ -204,80 +204,166 @@ class KloudStack_Migration_BackgroundExport {
     private static function _run_db_export( string $job_id, string $sas_url, array $hints = [] ): bool {
         self::_validate_sas_url( $sas_url );
 
-        // exec() is required for mysqldump. Available by default on Azure App Service
-        // Linux, but may be disabled on some shared hosting environments.
-        if ( ! function_exists( 'exec' ) ) {
-            throw new Exception( 'Database export requires exec() which is not available on this server. Contact your hosting provider.' );
-        }
+        $disable_fns    = array_filter( array_map( 'trim', explode( ',', (string) ini_get( 'disable_functions' ) ) ) );
+        $exec_available = function_exists( 'exec' ) && ! in_array( 'exec', $disable_fns, true );
 
-        // Apply optional stream rate limit hint (kbps). When the agent detects high CPU
-        // during export it may set stream_rate_limit_kbps to throttle the mysqldump pipe.
         $rate_limit_kbps = isset( $hints['stream_rate_limit_kbps'] ) ? max( 128, (int) $hints['stream_rate_limit_kbps'] ) : 0;
 
         $tmp_file = tempnam( sys_get_temp_dir(), 'ks_db_' ) . '.sql';
 
         try {
-            // Build mysqldump command with individual argument escaping.
-            // --single-transaction: InnoDB snapshot — zero table locking, invisible to other connections.
-            // --quick: reads one row at a time — minimal RAM on restricted shared hosting accounts.
-            // --routines --triggers --add-drop-table: full schema + data export.
-            $host     = escapeshellarg( DB_HOST );
-            $user     = escapeshellarg( DB_USER );
-            $database = escapeshellarg( DB_NAME );
-            $tmp_esc  = escapeshellarg( $tmp_file );
+            if ( $exec_available ) {
+                self::_mysqldump_export( $tmp_file, $rate_limit_kbps );
+            } else {
+                self::_wpdb_export( $job_id, $tmp_file );
+            }
 
-            // DB_PASSWORD is passed via env var to avoid appearing on process list
-            putenv( 'MYSQL_PWD=' . DB_PASSWORD );
+            self::_update_job( $job_id, [ 'progress' => 70 ] );
+            self::_upload_file_to_blob( $sas_url, $tmp_file, 'application/octet-stream' );
+            self::_update_job( $job_id, [ 'progress' => 100 ] );
+            return true;
 
-            if ( $rate_limit_kbps > 0 ) {
-                // pv throttles the byte rate of the pipe when a CPU limit hint is active.
-                // Falls back gracefully if pv is not installed (most shared hosts lack it).
-                $pv_available = ! empty( shell_exec( 'which pv 2>/dev/null' ) );
-                if ( $pv_available ) {
-                    $rate_arg = escapeshellarg( $rate_limit_kbps . 'k' );
-                    $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
-                         . "--quick --routines --triggers --add-drop-table {$database} "
-                         . "| pv -q -L {$rate_arg} > {$tmp_esc} 2>/dev/null'";
-                } else {
-                    $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
-                         . "--quick --routines --triggers --add-drop-table {$database} "
-                         . "> {$tmp_esc} 2>/dev/null'";
-                }
+        } finally {
+            if ( file_exists( $tmp_file ) ) {
+                @unlink( $tmp_file );
+            }
+            putenv( 'MYSQL_PWD=' );
+        }
+    }
+
+    /**
+     * Export via mysqldump — used when exec() is available (default path).
+     * --single-transaction: InnoDB snapshot, zero table locking.
+     * --quick: reads one row at a time, minimal RAM on restricted accounts.
+     */
+    private static function _mysqldump_export( string $tmp_file, int $rate_limit_kbps = 0 ): void {
+        $host     = escapeshellarg( DB_HOST );
+        $user     = escapeshellarg( DB_USER );
+        $database = escapeshellarg( DB_NAME );
+        $tmp_esc  = escapeshellarg( $tmp_file );
+
+        putenv( 'MYSQL_PWD=' . DB_PASSWORD );
+
+        if ( $rate_limit_kbps > 0 ) {
+            $pv_available = ! empty( shell_exec( 'which pv 2>/dev/null' ) );
+            if ( $pv_available ) {
+                $rate_arg = escapeshellarg( $rate_limit_kbps . 'k' );
+                $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
+                     . "--quick --routines --triggers --add-drop-table {$database} "
+                     . "| pv -q -L {$rate_arg} > {$tmp_esc} 2>/dev/null'";
             } else {
                 $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
                      . "--quick --routines --triggers --add-drop-table {$database} "
                      . "> {$tmp_esc} 2>/dev/null'";
             }
+        } else {
+            $cmd = "bash -c 'mysqldump --host={$host} --user={$user} --single-transaction "
+                 . "--quick --routines --triggers --add-drop-table {$database} "
+                 . "> {$tmp_esc} 2>/dev/null'";
+        }
 
-            $output    = [];
-            $exit_code = 0;
-            exec( $cmd, $output, $exit_code );
+        $output    = [];
+        $exit_code = 0;
+        exec( $cmd, $output, $exit_code );
 
-            // Clear password from environment immediately
-            putenv( 'MYSQL_PWD=' );
+        putenv( 'MYSQL_PWD=' );
 
-            if ( 0 !== $exit_code ) {
-                throw new Exception( 'mysqldump failed (exit=' . $exit_code . '): ' . implode( ' ', $output ) );
+        if ( 0 !== $exit_code ) {
+            throw new Exception( 'mysqldump failed (exit=' . $exit_code . '): ' . implode( ' ', $output ) );
+        }
+        if ( ! file_exists( $tmp_file ) || 0 === filesize( $tmp_file ) ) {
+            throw new Exception( 'mysqldump produced empty output.' );
+        }
+    }
+
+    /**
+     * PHP-native DB export fallback for environments where exec() is disabled
+     * (e.g. WP Engine, Kinsta, some shared hosting).
+     *
+     * Iterates all tables via SHOW TABLES, writes DDL via SHOW CREATE TABLE, and
+     * dumps rows as batched INSERT statements (500 rows/batch) to avoid PHP memory
+     * exhaustion on large tables.
+     *
+     * Output is compatible with the mysqldump import path used by run_db_import.
+     * Progress updates run from 5% to 65%, leaving 70% for upload completion.
+     */
+    private static function _wpdb_export( string $job_id, string $tmp_file ): void {
+        global $wpdb;
+
+        $fh = fopen( $tmp_file, 'wb' );
+        if ( ! $fh ) {
+            throw new Exception( 'PHP-native DB export: failed to open temp file for writing.' );
+        }
+
+        try {
+            fwrite( $fh, "-- KloudStack PHP-native export (exec() unavailable)\n" );
+            fwrite( $fh, "-- Generated: " . gmdate( 'Y-m-d H:i:s' ) . " UTC\n\n" );
+            fwrite( $fh, "SET NAMES utf8mb4;\n" );
+            fwrite( $fh, "SET FOREIGN_KEY_CHECKS=0;\n\n" );
+
+            $tables = $wpdb->get_col( 'SHOW TABLES' );
+            $total  = count( $tables );
+            $done   = 0;
+
+            foreach ( $tables as $table ) {
+                $safe = '`' . str_replace( '`', '``', $table ) . '`';
+
+                // DDL
+                // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+                $create_row = $wpdb->get_row( "SHOW CREATE TABLE {$safe}", ARRAY_N );
+                if ( $create_row ) {
+                    fwrite( $fh, "DROP TABLE IF EXISTS {$safe};\n" );
+                    fwrite( $fh, $create_row[1] . ";\n\n" );
+                }
+
+                // Row data — batched to avoid memory exhaustion on large tables
+                $offset = 0;
+                $batch  = 500;
+                while ( true ) {
+                    // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+                    $rows = $wpdb->get_results(
+                        $wpdb->prepare( "SELECT * FROM {$safe} LIMIT %d OFFSET %d", $batch, $offset ),
+                        ARRAY_A
+                    );
+                    if ( empty( $rows ) ) {
+                        break;
+                    }
+
+                    $col_names = implode( ', ', array_map(
+                        static fn( $c ) => '`' . str_replace( '`', '``', $c ) . '`',
+                        array_keys( $rows[0] )
+                    ) );
+
+                    $value_rows = [];
+                    foreach ( $rows as $row ) {
+                        $vals = array_map( static function ( $v ) {
+                            return is_null( $v ) ? 'NULL' : "'" . esc_sql( (string) $v ) . "'";
+                        }, array_values( $row ) );
+                        $value_rows[] = '(' . implode( ', ', $vals ) . ')';
+                    }
+
+                    fwrite( $fh, "INSERT INTO {$safe} ({$col_names}) VALUES\n" );
+                    fwrite( $fh, implode( ",\n", $value_rows ) . ";\n" );
+
+                    $offset += $batch;
+                    if ( count( $rows ) < $batch ) {
+                        break;
+                    }
+                }
+
+                fwrite( $fh, "\n" );
+                $done++;
+                self::_update_job( $job_id, [ 'progress' => 5 + (int) ( 60 * $done / max( 1, $total ) ) ] );
             }
 
-            if ( ! file_exists( $tmp_file ) || 0 === filesize( $tmp_file ) ) {
-                throw new Exception( 'mysqldump produced empty output.' );
-            }
-
-            self::_update_job( $job_id, [ 'progress' => 70 ] );
-
-            // Upload plain SQL to Azure Blob via SAS PUT
-            self::_upload_file_to_blob( $sas_url, $tmp_file, 'application/octet-stream' );
-
-            self::_update_job( $job_id, [ 'progress' => 100 ] );
-            return true;
+            fwrite( $fh, "SET FOREIGN_KEY_CHECKS=1;\n" );
 
         } finally {
-            // Always clean up temp file
-            if ( file_exists( $tmp_file ) ) {
-                unlink( $tmp_file );
-            }
-            putenv( 'MYSQL_PWD=' );
+            fclose( $fh );
+        }
+
+        if ( ! file_exists( $tmp_file ) || 0 === filesize( $tmp_file ) ) {
+            throw new Exception( 'PHP-native DB export produced empty output.' );
         }
     }
 
