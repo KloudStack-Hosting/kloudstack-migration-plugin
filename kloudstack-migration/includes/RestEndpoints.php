@@ -104,6 +104,12 @@ class KloudStack_Migration_RestEndpoints {
             'callback'            => [ __CLASS__, 'process_queue_trigger' ],
             'permission_callback' => [ __CLASS__, 'verify_token' ],
         ] );
+
+        register_rest_route( $ns, '/pre-flight', [
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => [ __CLASS__, 'pre_flight' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
     }
 
     // ------------------------------------------------------------------
@@ -283,6 +289,8 @@ class KloudStack_Migration_RestEndpoints {
             'php_memory_limit_mb'    => self::_php_memory_limit_mb(),
             'php_max_execution_time' => (int) ini_get( 'max_execution_time' ),
             'disk_free_mb'           => ( disk_free_space( ABSPATH ) !== false ) ? round( disk_free_space( ABSPATH ) / 1024 / 1024, 1 ) : null,
+            // WP7+ ships with native MCP support — agent uses this to skip /discover for WP7 sites.
+            'mcp_native'             => version_compare( $wp_version, '7.0', '>=' ),
         ], 200 );
     }
 
@@ -749,11 +757,113 @@ class KloudStack_Migration_RestEndpoints {
 
             // Hosting environment
             'hosting_platform'       => self::_detect_hosting_platform(),
+            'object_cache_active'    => wp_using_ext_object_cache(),
 
             // Temp disk space available for dump/zip files
             'tmp_free_mb'            => ( disk_free_space( sys_get_temp_dir() ) !== false )
                 ? round( disk_free_space( sys_get_temp_dir() ) / 1024 / 1024, 1 )
                 : null,
+        ], 200 );
+    }
+
+    // ------------------------------------------------------------------
+    // Endpoint: GET /pre-flight
+    // ------------------------------------------------------------------
+
+    /**
+     * Return a comprehensive pre-flight snapshot before export begins.
+     *
+     * Called by the MAE at the start of run_db_export so the LLM has full
+     * environment context before committing to an export strategy. Key decisions
+     * driven by this data:
+     *   - exec_available=false  → use PHP-native DB export fallback
+     *   - wpcron_enabled=false  → assume all content jobs must drain in one shutdown call
+     *   - tmp_free_mb too low   → warn customer before attempting DB dump
+     *   - blockers non-empty    → agent surfaces issue to customer before starting
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response
+     */
+    public static function pre_flight( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+
+        $wp_version = get_bloginfo( 'version' );
+
+        // DB size
+        $db_size_mb = (float) ( $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT ROUND( SUM( data_length + index_length ) / 1024 / 1024, 2 )
+                 FROM information_schema.TABLES WHERE table_schema = %s",
+                DB_NAME
+            )
+        ) ?? 0 );
+
+        // Media file count and size
+        $uploads_dir     = wp_upload_dir();
+        $uploads_basedir = $uploads_dir['basedir'];
+        $media_file_count = 0;
+        $media_size_bytes = 0;
+        if ( is_dir( $uploads_basedir ) ) {
+            $iter = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator( $uploads_basedir, FilesystemIterator::SKIP_DOTS ),
+                RecursiveIteratorIterator::LEAVES_ONLY
+            );
+            foreach ( $iter as $f ) {
+                if ( $f->isFile() ) {
+                    $media_file_count++;
+                    $media_size_bytes += $f->getSize();
+                }
+            }
+        }
+        $media_size_mb = round( $media_size_bytes / 1024 / 1024, 1 );
+
+        // Plugins and themes directory sizes
+        $plugins_size_mb = self::_dir_size_mb( WP_CONTENT_DIR . '/plugins' );
+        $themes_size_mb  = self::_dir_size_mb( WP_CONTENT_DIR . '/themes' );
+
+        // Capabilities
+        $disable_fns    = array_filter( array_map( 'trim', explode( ',', ini_get( 'disable_functions' ) ) ) );
+        $exec_available = function_exists( 'exec' ) && ! in_array( 'exec', $disable_fns, true );
+
+        // Temp disk space
+        $tmp_free_mb = ( disk_free_space( sys_get_temp_dir() ) !== false )
+            ? round( disk_free_space( sys_get_temp_dir() ) / 1024 / 1024, 1 )
+            : null;
+
+        // Estimated export duration (rough — 1 min per 100 MB DB + 1 min per 500 media files)
+        $db_minutes    = max( 1, ceil( $db_size_mb / 100 ) );
+        $media_minutes = max( 1, ceil( $media_file_count / 500 ) );
+        $estimated_export_minutes = $db_minutes + $media_minutes;
+
+        // Blockers — conditions that will cause export to fail without intervention
+        $blockers = [];
+        if ( ! $exec_available ) {
+            $blockers[] = 'exec_disabled';
+        }
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            $blockers[] = 'ziparchive_missing';
+        }
+        if ( $tmp_free_mb !== null && $tmp_free_mb < ( $db_size_mb * 1.5 ) ) {
+            $blockers[] = 'tmp_disk_too_small';
+        }
+
+        return new WP_REST_Response( [
+            'exec_available'           => $exec_available,
+            'ziparchive_available'     => class_exists( 'ZipArchive' ),
+            'fastcgi_available'        => function_exists( 'fastcgi_finish_request' ),
+            'wpcron_enabled'           => ! ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ),
+            'object_cache_active'      => wp_using_ext_object_cache(),
+            'hosting_platform'         => self::_detect_hosting_platform(),
+            'wp_version'               => $wp_version,
+            'mcp_native'               => version_compare( $wp_version, '7.0', '>=' ),
+            'db_size_mb'               => $db_size_mb,
+            'media_file_count'         => $media_file_count,
+            'media_size_mb'            => $media_size_mb,
+            'plugins_size_mb'          => $plugins_size_mb,
+            'themes_size_mb'           => $themes_size_mb,
+            'tmp_free_mb'              => $tmp_free_mb,
+            'estimated_export_minutes' => $estimated_export_minutes,
+            'blockers'                 => $blockers,
         ], 200 );
     }
 
@@ -903,6 +1013,14 @@ class KloudStack_Migration_RestEndpoints {
         }
         if ( getenv( 'KINSTA_CACHE_ZONE' ) !== false ) {
             return 'kinsta';
+        }
+        // GoDaddy: cPanel hosting sets GD_PHP_HANDLER; some plans define GD_COMMAND_LINE;
+        // hostnames often contain 'secureserver.net' (GoDaddy's internal network domain).
+        if ( getenv( 'GD_PHP_HANDLER' ) !== false
+            || defined( 'GD_COMMAND_LINE' )
+            || strpos( php_uname( 'n' ), 'secureserver' ) !== false
+        ) {
+            return 'godaddy';
         }
         return 'other';
     }
