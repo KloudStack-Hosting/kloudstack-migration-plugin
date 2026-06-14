@@ -147,6 +147,7 @@ class KloudStack_Migration_BackgroundExport {
                     : [];
 
                 // Mark as processing
+                error_log( '[KS Migration] process_queue: starting job=' . $job_id . ' type=' . $type );
                 self::_update_job( $job_id, [ 'status' => 'processing', 'progress' => 5 ] );
 
                 $success = false;
@@ -170,7 +171,7 @@ class KloudStack_Migration_BackgroundExport {
                         'status' => 'failed',
                         'error'  => substr( $e->getMessage(), 0, 500 ),
                     ] );
-                    error_log( "KloudStack Migration: job {$job_id} failed: " . $e->getMessage() );
+                    error_log( '[KS Migration] process_queue: job ' . $job_id . ' EXCEPTION: ' . $e->getMessage() );
                 }
 
                 if ( $success ) {
@@ -415,6 +416,8 @@ class KloudStack_Migration_BackgroundExport {
         string $sas_token,
         array $hints = []
     ): bool {
+        error_log( '[KS Migration] _run_media_stream: START job=' . $job_id . ' container=' . $container_base_url . ' prefix=' . $blob_prefix . ' sas_len=' . strlen( $sas_token ) );
+
         // Validate the container base URL points to Azure Blob Storage over HTTPS.
         if ( 0 !== strpos( $container_base_url, 'https://' ) ) {
             throw new Exception( 'container_base_url must use HTTPS.' );
@@ -482,6 +485,12 @@ class KloudStack_Migration_BackgroundExport {
         $total_files = count( $all_files );
         $total_bytes = array_sum( array_column( $all_files, 'size' ) );
 
+        error_log( '[KS Migration] _run_media_stream: enumerated total_files=' . $total_files . ' total_bytes=' . $total_bytes . ' base_dir=' . $base_dir );
+
+        if ( 0 === $total_files ) {
+            error_log( '[KS Migration] _run_media_stream: no files found — marking complete immediately' );
+        }
+
         // Update totals in transient so the polling loop can display accurate counts.
         self::_update_job( $job_id, [
             'total_files'  => $total_files,
@@ -516,6 +525,9 @@ class KloudStack_Migration_BackgroundExport {
                 }
             }
 
+            if ( 1 === $files_this_batch + 1 ) {
+                error_log( '[KS Migration] _run_media_stream: uploading first file=' . $blob_rel . ' size=' . $entry['size'] );
+            }
             self::_upload_blob_put( $blob_url, $entry['abs'], $mime_type );
 
             // Record as uploaded in checkpoint.
@@ -934,18 +946,21 @@ class KloudStack_Migration_BackgroundExport {
                 $option_name
             ) );
             if ( null === $db_val ) {
+                error_log( '[KS Migration] _update_job DB-fallback: ROW MISSING for ' . $job_id . ' (option=' . $option_name . ') wpdb_err=' . $wpdb->last_error );
                 return; // Genuinely missing — nothing to update.
             }
             $job = maybe_unserialize( $db_val );
             if ( ! is_array( $job ) ) {
+                error_log( '[KS Migration] _update_job DB-fallback: unserialize failed for ' . $job_id );
                 return;
             }
             $job = array_merge( $job, $updates );
-            $wpdb->update(
+            $rows = $wpdb->update(
                 $wpdb->options,
                 [ 'option_value' => maybe_serialize( $job ) ],
                 [ 'option_name'  => $option_name ]
             );
+            error_log( '[KS Migration] _update_job DB-fallback: ' . $job_id . ' rows_affected=' . $rows . ' progress=' . ( $updates['progress'] ?? '?' ) . ' status=' . ( $updates['status'] ?? '?' ) . ' wpdb_err=' . $wpdb->last_error );
             // Bust any stale in-memory option cache so the next get_transient() / get_option()
             // reads the fresh DB value rather than a cached 0% snapshot.
             wp_cache_delete( $option_name, 'options' );

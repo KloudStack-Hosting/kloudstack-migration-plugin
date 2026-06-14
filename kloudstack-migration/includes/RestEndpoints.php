@@ -110,6 +110,18 @@ class KloudStack_Migration_RestEndpoints {
             'callback'            => [ __CLASS__, 'pre_flight' ],
             'permission_callback' => [ __CLASS__, 'verify_token' ],
         ] );
+
+        register_rest_route( $ns, '/job-debug/(?P<job_id>[a-zA-Z0-9_-]+)', [
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => [ __CLASS__, 'job_debug' ],
+            'args'                => [
+                'job_id' => [
+                    'required'          => true,
+                    'sanitize_callback' => 'sanitize_key',
+                ],
+            ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
     }
 
     // ------------------------------------------------------------------
@@ -1078,9 +1090,66 @@ class KloudStack_Migration_RestEndpoints {
      * @param string $transient_key  Full transient key (without _transient_ prefix)
      * @param array  $job            Job data array to serialise
      */
+    /**
+     * Return raw DB diagnostic state for a job — used by Django when media stalls at 0%.
+     *
+     * Reports whether the shadow-write row exists, what value it holds, what the cache
+     * returns, and whether a test DB write round-trips correctly. Gives definitive
+     * evidence of which failure layer is active without requiring PHP error-log access.
+     */
+    public static function job_debug( WP_REST_Request $request ): WP_REST_Response {
+        global $wpdb;
+        $job_id      = $request->get_param( 'job_id' );
+        $option_name = '_transient_' . self::JOB_TRANSIENT_PREFIX . $job_id;
+
+        // Raw DB read — same query _update_job DB-fallback uses.
+        $db_val  = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            $option_name
+        ) );
+        $db_job  = ( null !== $db_val ) ? maybe_unserialize( $db_val ) : null;
+
+        // Cache read — what get_transient() returns in a normal (non-shutdown) request.
+        $cache_job = get_transient( self::JOB_TRANSIENT_PREFIX . $job_id );
+
+        // Queue state.
+        $queue         = get_option( KloudStack_Migration_BackgroundExport::QUEUE_OPTION, [] );
+        $job_in_queue  = false;
+        foreach ( $queue as $item ) {
+            if ( ( $item['job_id'] ?? '' ) === $job_id ) {
+                $job_in_queue = true;
+                break;
+            }
+        }
+
+        // DB write round-trip test — confirms $wpdb can write and read back in this context.
+        $test_key = '_ks_dbtest_' . time();
+        $wpdb->replace( $wpdb->options, [ 'option_name' => $test_key, 'option_value' => 'ok', 'autoload' => 'no' ] );
+        $test_read = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $test_key ) );
+        $wpdb->delete( $wpdb->options, [ 'option_name' => $test_key ] );
+
+        return new WP_REST_Response( [
+            'job_id'                 => $job_id,
+            'plugin_version'         => defined( 'KLOUDSTACK_MIGRATION_VERSION' ) ? KLOUDSTACK_MIGRATION_VERSION : 'unknown',
+            'db_row_exists'          => ( null !== $db_val ),
+            'db_status'              => is_array( $db_job ) ? ( $db_job['status']   ?? 'missing_key' ) : null,
+            'db_progress'            => is_array( $db_job ) ? ( $db_job['progress'] ?? -1 )            : null,
+            'db_last_error'          => $wpdb->last_error ?: null,
+            'cache_row_exists'       => ( false !== $cache_job ),
+            'cache_status'           => is_array( $cache_job ) ? ( $cache_job['status']   ?? 'missing_key' ) : null,
+            'cache_progress'         => is_array( $cache_job ) ? ( $cache_job['progress'] ?? -1 )            : null,
+            'queue_depth'            => count( $queue ),
+            'job_in_queue'           => $job_in_queue,
+            'db_write_roundtrip'     => ( $test_read === 'ok' ? 'pass' : 'fail' ),
+            'ext_object_cache'       => wp_using_ext_object_cache(),
+            'php_version'            => PHP_VERSION,
+            'timestamp'              => time(),
+        ], 200 );
+    }
+
     private static function _shadow_write_transient( string $transient_key, array $job ): void {
         global $wpdb;
-        $wpdb->replace(
+        $result = $wpdb->replace(
             $wpdb->options,
             [
                 'option_name'  => '_transient_' . $transient_key,
@@ -1088,6 +1157,11 @@ class KloudStack_Migration_RestEndpoints {
                 'autoload'     => 'no',
             ]
         );
+        if ( false === $result ) {
+            error_log( '[KS Migration] shadow_write FAILED for ' . $transient_key . ' — wpdb error: ' . $wpdb->last_error );
+        } else {
+            error_log( '[KS Migration] shadow_write OK for ' . $transient_key . ' (rows=' . $result . ')' );
+        }
     }
 
     /**
