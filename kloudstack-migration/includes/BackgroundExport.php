@@ -429,7 +429,9 @@ class KloudStack_Migration_BackgroundExport {
         $uploaded      = isset( $job_data['uploaded_files'] ) && is_array( $job_data['uploaded_files'] )
             ? $job_data['uploaded_files']
             : [];
-        $uploaded_set  = array_flip( $uploaded ); // O(1) lookups
+        $uploaded_set    = array_flip( $uploaded ); // O(1) lookups
+        // Restore running byte counter from checkpoint to avoid recomputing from all_files.
+        $bytes_uploaded  = isset( $job_data['bytes_uploaded'] ) ? (int) $job_data['bytes_uploaded'] : 0;
 
         // Build the full file list (only built once; subsequent batches use transient offset).
         $all_files = [];
@@ -466,7 +468,11 @@ class KloudStack_Migration_BackgroundExport {
             'total_bytes'  => $total_bytes,
         ] );
 
-        $files_this_batch = 0;
+        $files_this_batch    = 0;
+        // How often to persist the uploaded_files checkpoint. Progress (count/bytes) is
+        // written after every file (lightweight); the full path list is expensive to
+        // serialise so we batch it every N files to avoid O(N²) write traffic.
+        $checkpoint_interval = 50;
 
         foreach ( $all_files as $entry ) {
             $rel_path = $entry['rel'];
@@ -495,30 +501,33 @@ class KloudStack_Migration_BackgroundExport {
             // Record as uploaded in checkpoint.
             $uploaded[]              = $rel_path;
             $uploaded_set[$rel_path] = true;
+            $bytes_uploaded         += $entry['size'];
             $files_this_batch++;
 
-            // Persist checkpoint and progress after each file.
+            // Lightweight progress update after every file — no large arrays.
+            // min(99) reserves 100% for the final manifest signal.
+            // max(1) ensures progress is always > 0% once we've uploaded at least one file
+            // so the Django stagnation timer never fires prematurely on large libraries.
             $progress = $total_files > 0
-                ? min( 99, (int) ( count( $uploaded ) / $total_files * 99 ) )
+                ? max( 1, min( 99, (int) ( count( $uploaded ) / $total_files * 99 ) ) )
                 : 99;
             self::_update_job( $job_id, [
                 'progress'       => $progress,
                 'files_uploaded' => count( $uploaded ),
-                'bytes_uploaded' => array_sum(
-                    array_map(
-                        fn( $r ) => $all_files[ array_search( $r, array_column( $all_files, 'rel' ), true ) ]['size'] ?? 0,
-                        $uploaded
-                    )
-                ),
-                'uploaded_files' => $uploaded,
+                'bytes_uploaded' => $bytes_uploaded,
             ] );
+
+            // Heavy checkpoint (uploaded_files path list) every N files so re-runs skip
+            // already-uploaded files without writing a growing blob on every single PUT.
+            if ( 0 === $files_this_batch % $checkpoint_interval ) {
+                self::_update_job( $job_id, [ 'uploaded_files' => $uploaded ] );
+            }
 
             // Yield after the batch limit to allow WP-Cron to reschedule.
             if ( $files_this_batch >= $batch_size ) {
-                // Mark job as still processing (not failed) and exit cleanly.
-                // WP-Cron will re-enqueue this job on the next tick and resume
-                // from the checkpoint transient.
-                self::_update_job( $job_id, [ 'status' => 'processing' ] );
+                // Flush the final checkpoint before exiting so the next cron tick
+                // resumes from where we stopped, not from the last 50-file boundary.
+                self::_update_job( $job_id, [ 'status' => 'processing', 'uploaded_files' => $uploaded ] );
                 return false; // Returning false re-queues the item for the next cron tick.
             }
         }
@@ -887,7 +896,8 @@ class KloudStack_Migration_BackgroundExport {
 
     private static function _update_job( string $job_id, array $updates ): void {
         global $wpdb;
-        $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
+        $transient_key  = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
+        $option_name    = '_transient_' . $transient_key;
 
         // Primary path: normal transient read/write (works outside shutdown context).
         $job = get_transient( $transient_key );
@@ -895,12 +905,13 @@ class KloudStack_Migration_BackgroundExport {
         if ( false === $job ) {
             // Fallback for post-fastcgi_finish_request shutdown context: WordPress's own
             // shutdown function fires do_action('shutdown') — which closes the object cache
-            // (W3TC/Redis) — BEFORE our shutdown function runs (PHP FIFO order). After that,
-            // get_transient() returns false even though the transient exists in the DB.
-            // Read and write directly via $wpdb to bypass the broken cache layer.
+            // (W3TC, APCu, Redis) — BEFORE our shutdown function runs (PHP FIFO order).
+            // Also fires when another PHP-FPM worker created the transient via a
+            // process-local cache (APCu), making it invisible to this worker's get_transient().
+            // RestEndpoints::_shadow_write_transient() guarantees the row exists in wp_options.
             $db_val = $wpdb->get_var( $wpdb->prepare(
                 "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-                '_transient_' . $transient_key
+                $option_name
             ) );
             if ( null === $db_val ) {
                 return; // Genuinely missing — nothing to update.
@@ -913,13 +924,24 @@ class KloudStack_Migration_BackgroundExport {
             $wpdb->update(
                 $wpdb->options,
                 [ 'option_value' => maybe_serialize( $job ) ],
-                [ 'option_name'  => '_transient_' . $transient_key ]
+                [ 'option_name'  => $option_name ]
             );
+            // Bust any stale in-memory option cache so the next get_transient() / get_option()
+            // reads the fresh DB value rather than a cached 0% snapshot.
+            wp_cache_delete( $option_name, 'options' );
             return;
         }
 
         $job = array_merge( $job, $updates );
         set_transient( $transient_key, $job, KloudStack_Migration_RestEndpoints::JOB_TTL );
+        // Mirror the update into wp_options so the shadow copy (_shadow_write_transient) stays
+        // in sync. This ensures the DB-fallback path (above) always sees the latest value
+        // even after many _update_job() calls in a long-running shutdown context.
+        $wpdb->update(
+            $wpdb->options,
+            [ 'option_value' => maybe_serialize( $job ) ],
+            [ 'option_name'  => $option_name ]
+        );
     }
 
     private static function _job_status( string $job_id ): string {

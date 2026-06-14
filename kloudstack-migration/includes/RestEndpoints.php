@@ -350,6 +350,7 @@ class KloudStack_Migration_RestEndpoints {
         ];
 
         set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
+        self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
 
         // Enqueue into BackgroundExport queue
         KloudStack_Migration_BackgroundExport::enqueue( $job_id, 'db_export', $sas_url );
@@ -495,6 +496,7 @@ class KloudStack_Migration_RestEndpoints {
         ];
 
         set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
+        self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
 
         KloudStack_Migration_BackgroundExport::enqueue(
             $job_id,
@@ -608,6 +610,7 @@ class KloudStack_Migration_RestEndpoints {
             ];
 
             set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
+            self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
 
             KloudStack_Migration_BackgroundExport::enqueue(
                 $job_id,
@@ -1033,6 +1036,35 @@ class KloudStack_Migration_RestEndpoints {
             return -1;
         }
         return (int) ( wp_convert_hr_to_bytes( $val ) / 1024 / 1024 );
+    }
+
+    /**
+     * Write the job transient directly to wp_options as a shadow copy.
+     *
+     * set_transient() stores data only in the active object cache when an external
+     * driver is installed (W3TC with APCu, Redis, Memcached). If the driver is
+     * process-local (APCu) the data is invisible to other PHP-FPM workers. When a
+     * different worker runs BackgroundExport::process_queue() in shutdown context, its
+     * _update_job() DB-fallback reads wp_options — and finds nothing, so every update
+     * silently no-ops and progress never reports.
+     *
+     * Calling this after set_transient() guarantees there is always a row in wp_options
+     * that the DB-fallback can read and overwrite, regardless of which object cache
+     * driver is in use or whether a different worker created the record.
+     *
+     * @param string $transient_key  Full transient key (without _transient_ prefix)
+     * @param array  $job            Job data array to serialise
+     */
+    private static function _shadow_write_transient( string $transient_key, array $job ): void {
+        global $wpdb;
+        $wpdb->replace(
+            $wpdb->options,
+            [
+                'option_name'  => '_transient_' . $transient_key,
+                'option_value' => maybe_serialize( $job ),
+                'autoload'     => 'no',
+            ]
+        );
     }
 
     /**
