@@ -124,6 +124,9 @@ class KloudStack_Migration_BackgroundExport {
 
             $processed = 0;
             $remaining = [];
+            // Track every job ID we read from the queue snapshot so we can detect
+            // items added by concurrent requests (e.g. /upload-media) while we process.
+            $original_ids = array_flip( array_column( $queue, 'job_id' ) );
 
             foreach ( $queue as $item ) {
                 if ( $processed >= self::MAX_JOBS_PER_RUN ) {
@@ -179,7 +182,24 @@ class KloudStack_Migration_BackgroundExport {
                 $processed++;
             }
 
-            update_option( self::QUEUE_OPTION, $remaining, false );
+            // Re-read the queue from DB to pick up any items that were enqueued by a
+            // concurrent request while we were processing (the classic race: Worker A
+            // reads [plugins, themes], Worker B enqueues media, Worker A writes
+            // remaining=[] and wipes the media item before Worker B ever runs it).
+            // We add only items not in our original snapshot AND not already done.
+            $fresh_queue = get_option( self::QUEUE_OPTION, [] );
+            $new_items   = [];
+            foreach ( $fresh_queue as $fresh_item ) {
+                $fid = $fresh_item['job_id'] ?? '';
+                if ( $fid && ! isset( $original_ids[ $fid ] ) ) {
+                    $s = self::_job_status( $fid );
+                    if ( 'complete' !== $s && 'failed' !== $s ) {
+                        $new_items[] = $fresh_item;
+                    }
+                }
+            }
+
+            update_option( self::QUEUE_OPTION, array_values( array_merge( $remaining, $new_items ) ), false );
         } finally {
             delete_transient( $lock_key );
         }
