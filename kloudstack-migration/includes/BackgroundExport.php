@@ -886,19 +886,58 @@ class KloudStack_Migration_BackgroundExport {
     // ------------------------------------------------------------------
 
     private static function _update_job( string $job_id, array $updates ): void {
+        global $wpdb;
         $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
-        $job           = get_transient( $transient_key );
+
+        // Primary path: normal transient read/write (works outside shutdown context).
+        $job = get_transient( $transient_key );
+
         if ( false === $job ) {
+            // Fallback for post-fastcgi_finish_request shutdown context: WordPress's own
+            // shutdown function fires do_action('shutdown') — which closes the object cache
+            // (W3TC/Redis) — BEFORE our shutdown function runs (PHP FIFO order). After that,
+            // get_transient() returns false even though the transient exists in the DB.
+            // Read and write directly via $wpdb to bypass the broken cache layer.
+            $db_val = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                '_transient_' . $transient_key
+            ) );
+            if ( null === $db_val ) {
+                return; // Genuinely missing — nothing to update.
+            }
+            $job = maybe_unserialize( $db_val );
+            if ( ! is_array( $job ) ) {
+                return;
+            }
+            $job = array_merge( $job, $updates );
+            $wpdb->update(
+                $wpdb->options,
+                [ 'option_value' => maybe_serialize( $job ) ],
+                [ 'option_name'  => '_transient_' . $transient_key ]
+            );
             return;
         }
+
         $job = array_merge( $job, $updates );
         set_transient( $transient_key, $job, KloudStack_Migration_RestEndpoints::JOB_TTL );
     }
 
     private static function _job_status( string $job_id ): string {
+        global $wpdb;
         $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
         $job           = get_transient( $transient_key );
-        return $job['status'] ?? 'unknown';
+        if ( false === $job ) {
+            // Same shutdown-context fallback as _update_job.
+            $db_val = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                '_transient_' . $transient_key
+            ) );
+            if ( null === $db_val ) {
+                return 'unknown';
+            }
+            $job = maybe_unserialize( $db_val );
+        }
+        return is_array( $job ) ? ( $job['status'] ?? 'unknown' ) : 'unknown';
     }
 
     /**
