@@ -261,6 +261,7 @@ class KloudStack_Migration_RestEndpoints {
         return new WP_REST_Response( [
             'site_url'      => get_site_url(),
             'home_url'      => get_home_url(),
+            'plugin_version' => defined( 'KLOUDSTACK_MIGRATION_VERSION' ) ? KLOUDSTACK_MIGRATION_VERSION : 'unknown',
             'wp_version'    => $wp_version,
             'php_version'   => PHP_VERSION,
             'plugins'       => $plugin_slugs,
