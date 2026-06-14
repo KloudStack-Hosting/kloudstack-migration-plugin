@@ -395,14 +395,36 @@ class KloudStack_Migration_RestEndpoints {
      */
     public static function job_status( WP_REST_Request $request ) {
         $job_id = $request->get_param( 'job_id' );
-        $job    = get_transient( self::JOB_TRANSIENT_PREFIX . $job_id );
+
+        // Read directly from wp_options rather than relying on get_transient().
+        //
+        // BackgroundExport::_update_job() writes progress updates to wp_options via
+        // direct $wpdb calls (both its DB-fallback path and its normal path since v1.7.2).
+        // However when the object cache driver is Redis or a process-local store (APCu /
+        // W3TC in-memory), get_transient() returns a stale 0% snapshot from the cache
+        // even though the DB already has the real progress — the cache is either
+        // disconnected (shutdown FIFO order) or was written by a different PHP-FPM worker
+        // and can't be invalidated from the updating worker.
+        //
+        // Bypassing the cache here guarantees Django always sees the most recently
+        // written DB value, regardless of which PHP worker ran the export or whether the
+        // object cache is still alive.
+        global $wpdb;
+        $db_val = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            '_transient_' . self::JOB_TRANSIENT_PREFIX . $job_id
+        ) );
+        $job = ( null !== $db_val ) ? maybe_unserialize( $db_val ) : false;
+
+        // Fall back to cache if no DB row exists (job predates shadow-write or was never
+        // committed to wp_options by an earlier plugin version).
+        if ( false === $job || ! is_array( $job ) ) {
+            $job = get_transient( self::JOB_TRANSIENT_PREFIX . $job_id );
+        }
 
         if ( false === $job ) {
-            // Transient may have been evicted by a shared hosting object cache (e.g. GoDaddy
-            // Memcached under memory pressure) even within the 24-hour TTL. Before returning
-            // 404, check whether the job is still in the persistent queue (wp_options) — if
-            // so, it hasn't run yet and we can synthesise a safe "queued" response so the
-            // server-side poller keeps waiting rather than failing the migration.
+            // Transient missing from both DB and cache. Check the queue so the poller
+            // keeps waiting rather than failing prematurely.
             $queue = get_option( KloudStack_Migration_BackgroundExport::QUEUE_OPTION, [] );
             foreach ( $queue as $item ) {
                 if ( ( $item['job_id'] ?? '' ) === $job_id ) {
