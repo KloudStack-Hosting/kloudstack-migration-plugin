@@ -106,18 +106,53 @@ class KloudStack_Migration_BackgroundExport {
      * Called by WP-Cron every minute.
      */
     public static function process_queue(): void {
-        // Prevent concurrent execution. The shutdown function registered by export_db /
-        // upload_media and WP-Cron can both fire process_queue() at the same time.
-        // A transient-based mutex stops double-processing and double resource usage.
-        $lock_key = 'ks_mig_queue_lock';
-        if ( get_transient( $lock_key ) ) {
-            return; // Another invocation is already running — skip silently
+        global $wpdb;
+
+        // DB-level mutex using INSERT IGNORE — works in shutdown context where
+        // set_transient() / get_transient() fail because the object cache (APCu, W3TC,
+        // Redis) is closed by WordPress's own shutdown hook before ours runs (PHP FIFO).
+        // A transient-based lock is silently a no-op here, allowing concurrent execution.
+        $lock_name = 'ks_mig_queue_lock';
+        $now       = time();
+
+        $acquired = (bool) $wpdb->query( $wpdb->prepare(
+            "INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            $lock_name,
+            (string) $now
+        ) );
+
+        if ( ! $acquired ) {
+            // Row exists — check if it is stale (process was killed before finally released it).
+            $lock_ts = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                $lock_name
+            ) );
+            if ( $lock_ts > 0 && ( $now - $lock_ts ) < 600 ) {
+                return; // Fresh lock — another invocation is running.
+            }
+            // Stale lock (> 10 min) — force-claim it so a killed process cannot block forever.
+            $wpdb->update( $wpdb->options, [ 'option_value' => (string) $now ], [ 'option_name' => $lock_name ] );
         }
-        // TTL = 10 min. Auto-expires if the process is killed before the finally block.
-        set_transient( $lock_key, 1, 600 );
 
         try {
-            $queue = get_option( self::QUEUE_OPTION, [] );
+            // Read the queue directly from DB, bypassing the WordPress object cache.
+            //
+            // get_option() returns from the per-process in-memory cache first.  When two
+            // PHP-FPM workers handle concurrent REST requests (e.g. Worker A for
+            // export-site-content, Worker B for upload-media), each worker's cache only
+            // reflects its OWN update_option() calls.  Worker A's cache has [plugins, themes];
+            // Worker B wrote [plugins, themes, media] to DB afterwards but Worker A's cache
+            // never received that update.  Calling get_option() in Worker A's shutdown
+            // therefore returns stale [plugins, themes], and the media job is silently wiped
+            // when update_option( QUEUE_OPTION, [] ) is written at the end of the run.
+            $raw   = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                self::QUEUE_OPTION
+            ) );
+            $queue = $raw ? maybe_unserialize( $raw ) : [];
+            if ( ! is_array( $queue ) ) {
+                $queue = [];
+            }
             if ( empty( $queue ) ) {
                 return;
             }
@@ -183,12 +218,18 @@ class KloudStack_Migration_BackgroundExport {
                 $processed++;
             }
 
-            // Re-read the queue from DB to pick up any items that were enqueued by a
-            // concurrent request while we were processing (the classic race: Worker A
-            // reads [plugins, themes], Worker B enqueues media, Worker A writes
-            // remaining=[] and wipes the media item before Worker B ever runs it).
-            // We add only items not in our original snapshot AND not already done.
-            $fresh_queue = get_option( self::QUEUE_OPTION, [] );
+            // Re-read the queue directly from DB (bypassing per-process cache — same
+            // reason as the initial read above) to pick up items enqueued by a concurrent
+            // request while we were processing.  We add only items not in our original
+            // snapshot AND not already done.
+            $raw_fresh   = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                self::QUEUE_OPTION
+            ) );
+            $fresh_queue = $raw_fresh ? maybe_unserialize( $raw_fresh ) : [];
+            if ( ! is_array( $fresh_queue ) ) {
+                $fresh_queue = [];
+            }
             $new_items   = [];
             foreach ( $fresh_queue as $fresh_item ) {
                 $fid = $fresh_item['job_id'] ?? '';
@@ -202,7 +243,7 @@ class KloudStack_Migration_BackgroundExport {
 
             update_option( self::QUEUE_OPTION, array_values( array_merge( $remaining, $new_items ) ), false );
         } finally {
-            delete_transient( $lock_key );
+            $wpdb->delete( $wpdb->options, [ 'option_name' => $lock_name ] );
         }
     }
 
