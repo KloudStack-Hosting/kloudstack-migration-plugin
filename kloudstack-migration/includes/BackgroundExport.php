@@ -496,27 +496,34 @@ class KloudStack_Migration_BackgroundExport {
         $batch_size = 500;
 
         // Load checkpoint — list of relative paths already uploaded this job.
-        // Uses the same DB fallback as _update_job(): in shutdown context (after
-        // fastcgi_finish_request) WordPress's do_action('shutdown') closes the object
-        // cache (APCu / W3TC / Redis) BEFORE our shutdown function fires (PHP FIFO).
-        // get_transient() then returns false, losing the checkpoint and forcing the job
-        // to re-process from file 0 every cron tick — causing permanent 20% stall.
-        $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
-        $job_data      = get_transient( $transient_key );
-        if ( false === $job_data ) {
-            $db_val   = $wpdb->get_var( $wpdb->prepare(
-                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-                '_transient_' . $transient_key
-            ) );
-            $job_data = $db_val ? maybe_unserialize( $db_val ) : null;
-            error_log( '[KS Migration] _run_media_stream: checkpoint DB-fallback job=' . $job_id . ' found=' . ( null !== $job_data ? 'yes' : 'no' ) );
-        }
-        $uploaded      = isset( $job_data['uploaded_files'] ) && is_array( $job_data['uploaded_files'] )
-            ? $job_data['uploaded_files']
-            : [];
-        $uploaded_set    = array_flip( $uploaded ); // O(1) lookups
-        // Restore running byte counter from checkpoint to avoid recomputing from all_files.
-        $bytes_uploaded  = isset( $job_data['bytes_uploaded'] ) ? (int) $job_data['bytes_uploaded'] : 0;
+        //
+        // v1.8.0 root-cause fix: the checkpoint must NOT use get_transient() at any point.
+        //
+        // With ext_object_cache=True (APCu/Redis), WordPress stores transients exclusively
+        // in the external cache and never writes them to wp_options.  Two separate failure
+        // modes combine to permanently stall the job at exactly one batch (20% for 2500 files):
+        //
+        // 1. SHUTDOWN CONTEXT (first batch, fired from /upload_media REST shutdown function):
+        //    do_action('shutdown') closes APCu/Redis BEFORE our callback runs (PHP FIFO).
+        //    get_transient() returns false. The v1.7.9 DB fallback reads _transient_ks_...
+        //    from wp_options, but with ext_object_cache=True that row was never written by
+        //    set_transient() — so the fallback also returns null. uploaded_files=[].
+        //
+        // 2. WP-CRON TICKS (subsequent batches, new PHP process, cache open):
+        //    get_transient() succeeds — but returns the *original* job state from creation
+        //    time (uploaded_files=[]).  The shutdown-context _update_job() calls only wrote
+        //    to wp_options via DB-fallback; they never updated the external cache.  So every
+        //    WP-Cron tick reads the stale cached state and re-uploads the same 500 files.
+        //
+        // Fix: store the uploaded-files checkpoint in a dedicated wp_options key
+        // (ks_mig_ckpt_<job_id>) using $wpdb->replace() for writes and $wpdb->get_var()
+        // for reads.  This bypasses the entire WordPress transient/cache stack and works
+        // identically in both shutdown context and normal WP-Cron execution.
+        $ckpt           = self::_read_media_checkpoint( $job_id );
+        $uploaded       = $ckpt['uploaded_files'];
+        $bytes_uploaded = $ckpt['bytes_uploaded'];
+        $uploaded_set   = array_flip( $uploaded ); // O(1) lookups
+        error_log( '[KS Migration] _run_media_stream: checkpoint loaded job=' . $job_id . ' already_uploaded=' . count( $uploaded ) . ' bytes_uploaded=' . $bytes_uploaded );
 
         // Build the full file list (only built once; subsequent batches use transient offset).
         $all_files = [];
@@ -613,15 +620,17 @@ class KloudStack_Migration_BackgroundExport {
 
             // Heavy checkpoint (uploaded_files path list) every N files so re-runs skip
             // already-uploaded files without writing a growing blob on every single PUT.
+            // Written directly to wp_options (bypasses cache) — see _write_media_checkpoint().
             if ( 0 === $files_this_batch % $checkpoint_interval ) {
-                self::_update_job( $job_id, [ 'uploaded_files' => $uploaded ] );
+                self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
             }
 
             // Yield after the batch limit to allow WP-Cron to reschedule.
             if ( $files_this_batch >= $batch_size ) {
-                // Flush the final checkpoint before exiting so the next cron tick
-                // resumes from where we stopped, not from the last 50-file boundary.
-                self::_update_job( $job_id, [ 'status' => 'processing', 'uploaded_files' => $uploaded ] );
+                // Flush the final checkpoint directly to wp_options before exiting so the
+                // next cron tick resumes from where we stopped (bypasses external cache).
+                self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
+                self::_update_job( $job_id, [ 'status' => 'processing' ] );
                 return false; // Returning false re-queues the item for the next cron tick.
             }
         }
@@ -652,6 +661,9 @@ class KloudStack_Migration_BackgroundExport {
             'files_uploaded' => $total_files,
             'bytes_uploaded' => $total_bytes,
         ] );
+
+        // Clean up the dedicated checkpoint row — job is complete.
+        self::_delete_media_checkpoint( $job_id );
 
         return true;
     }
@@ -1090,6 +1102,70 @@ class KloudStack_Migration_BackgroundExport {
             $job = maybe_unserialize( $db_val );
         }
         return is_array( $job ) ? ( $job['status'] ?? 'unknown' ) : 'unknown';
+    }
+
+    // ------------------------------------------------------------------
+    // Media checkpoint helpers — direct wp_options read/write, no cache
+    // ------------------------------------------------------------------
+
+    /**
+     * Return the wp_options key used to store the media upload checkpoint.
+     * Kept short to stay well under the 191-byte index limit on option_name.
+     */
+    private static function _ckpt_option_key( string $job_id ): string {
+        return 'ks_mig_ckpt_' . $job_id;
+    }
+
+    /**
+     * Read the media upload checkpoint directly from wp_options, bypassing the
+     * WordPress object cache entirely.  Works in both shutdown context (cache closed)
+     * and normal WP-Cron execution (cache open but stale).
+     *
+     * @return array{ uploaded_files: string[], bytes_uploaded: int }
+     */
+    private static function _read_media_checkpoint( string $job_id ): array {
+        global $wpdb;
+        $row = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            self::_ckpt_option_key( $job_id )
+        ) );
+        if ( ! $row ) {
+            return [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
+        }
+        $data = maybe_unserialize( $row );
+        return is_array( $data )
+            ? [
+                'uploaded_files' => is_array( $data['uploaded_files'] ?? null ) ? $data['uploaded_files'] : [],
+                'bytes_uploaded' => (int) ( $data['bytes_uploaded'] ?? 0 ),
+            ]
+            : [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
+    }
+
+    /**
+     * Persist the media upload checkpoint directly to wp_options via REPLACE,
+     * bypassing the WordPress object cache.
+     */
+    private static function _write_media_checkpoint( string $job_id, array $uploaded, int $bytes_uploaded ): void {
+        global $wpdb;
+        $wpdb->replace(
+            $wpdb->options,
+            [
+                'option_name'  => self::_ckpt_option_key( $job_id ),
+                'option_value' => maybe_serialize( [
+                    'uploaded_files' => $uploaded,
+                    'bytes_uploaded' => $bytes_uploaded,
+                ] ),
+                'autoload'     => 'no',
+            ]
+        );
+    }
+
+    /**
+     * Delete the media upload checkpoint from wp_options on successful job completion.
+     */
+    private static function _delete_media_checkpoint( string $job_id ): void {
+        global $wpdb;
+        $wpdb->delete( $wpdb->options, [ 'option_name' => self::_ckpt_option_key( $job_id ) ] );
     }
 
     /**
