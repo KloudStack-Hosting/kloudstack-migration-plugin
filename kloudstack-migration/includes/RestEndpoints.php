@@ -499,7 +499,12 @@ class KloudStack_Migration_RestEndpoints {
         $params             = $request->get_json_params();
         $container_base_url = sanitize_url( $params['container_base_url'] ?? '' );
         $blob_prefix        = sanitize_text_field( $params['blob_prefix'] ?? '' );
-        $sas_token          = sanitize_text_field( $params['sas_token'] ?? '' );
+        // Do NOT use sanitize_text_field() on the SAS token — it strips URL-encoded
+        // octets (%3A, %3D, %2B etc.) which corrupts the expiry date and signature,
+        // causing Azure to return 403 AuthenticationFailed / "fields not well formed".
+        // The token comes from a trusted authenticated caller (Django backend) and is
+        // used only as a URL query-string component, so no additional sanitisation is needed.
+        $sas_token = (string) ( $params['sas_token'] ?? '' );
 
         if ( empty( $container_base_url ) || empty( $blob_prefix ) || empty( $sas_token ) ) {
             return new WP_REST_Response(
