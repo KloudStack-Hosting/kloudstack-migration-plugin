@@ -1117,26 +1117,41 @@ class KloudStack_Migration_BackgroundExport {
     }
 
     /**
-     * Read the media upload checkpoint directly from wp_options, bypassing the
-     * WordPress object cache entirely.  Works in both shutdown context (cache closed)
-     * and normal WP-Cron execution (cache open but stale).
+     * Read the media upload checkpoint using a raw mysqli query, bypassing both the
+     * WordPress object cache AND W3TC's database cache hooks entirely.
+     *
+     * Root cause of the v1.8.0/v1.8.1 stall: W3TC database cache (backed by APCu when
+     * Redis is unavailable) caches the initial NULL result for the ks_mig_ckpt_ SELECT.
+     * When $wpdb->replace() writes the checkpoint, W3TC should invalidate the APCu cache
+     * entry, but the invalidation silently fails when Redis is unreachable.  Every
+     * subsequent $wpdb->get_var() call then hits the stale NULL cache, returning [] for
+     * uploaded_files so each batch re-uploads the same 500 files.  Using raw mysqli_query
+     * on $wpdb->dbh bypasses $wpdb->query() entirely, removing all WordPress/W3TC hooks.
      *
      * @return array{ uploaded_files: string[], bytes_uploaded: int }
      */
     private static function _read_media_checkpoint( string $job_id ): array {
         global $wpdb;
-        $key = self::_ckpt_option_key( $job_id );
-        $row = $wpdb->get_var( $wpdb->prepare(
+        $key    = self::_ckpt_option_key( $job_id );
+        $sql    = $wpdb->prepare(
             "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
             $key
-        ) );
-        if ( ! $row ) {
-            error_log( '[KS Migration] _read_media_checkpoint: NO ROW job=' . $job_id . ' key=' . $key . ' wpdb_err=' . ( $wpdb->last_error ?: 'none' ) );
+        );
+        $result = mysqli_query( $wpdb->dbh, $sql );
+        $raw    = false;
+        if ( $result ) {
+            $row = mysqli_fetch_row( $result );
+            $raw = $row ? $row[0] : false;
+            mysqli_free_result( $result );
+        }
+        if ( ! $raw ) {
+            $mysqli_err = mysqli_error( $wpdb->dbh ) ?: 'none';
+            error_log( '[KS Migration] _read_media_checkpoint: NO ROW job=' . $job_id . ' key=' . $key . ' mysqli_err=' . $mysqli_err );
             return [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
         }
-        $data = maybe_unserialize( $row );
+        $data = maybe_unserialize( $raw );
         if ( ! is_array( $data ) ) {
-            error_log( '[KS Migration] _read_media_checkpoint: UNSERIALIZE FAILED job=' . $job_id . ' row_len=' . strlen( $row ) );
+            error_log( '[KS Migration] _read_media_checkpoint: UNSERIALIZE FAILED job=' . $job_id . ' raw_len=' . strlen( $raw ) );
             return [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
         }
         $files_count = isset( $data['uploaded_files'] ) && is_array( $data['uploaded_files'] ) ? count( $data['uploaded_files'] ) : 0;
@@ -1148,24 +1163,25 @@ class KloudStack_Migration_BackgroundExport {
     }
 
     /**
-     * Persist the media upload checkpoint directly to wp_options via REPLACE,
-     * bypassing the WordPress object cache.
+     * Persist the media upload checkpoint using a raw mysqli query, bypassing both the
+     * WordPress object cache AND W3TC's database cache hooks (same reason as _read).
      */
     private static function _write_media_checkpoint( string $job_id, array $uploaded, int $bytes_uploaded ): void {
         global $wpdb;
-        $key  = self::_ckpt_option_key( $job_id );
-        $rows = $wpdb->replace(
-            $wpdb->options,
-            [
-                'option_name'  => $key,
-                'option_value' => maybe_serialize( [
-                    'uploaded_files' => $uploaded,
-                    'bytes_uploaded' => $bytes_uploaded,
-                ] ),
-                'autoload'     => 'no',
-            ]
+        $key   = self::_ckpt_option_key( $job_id );
+        $value = maybe_serialize( [
+            'uploaded_files' => $uploaded,
+            'bytes_uploaded' => $bytes_uploaded,
+        ] );
+        $sql   = $wpdb->prepare(
+            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no') ON DUPLICATE KEY UPDATE option_value = VALUES(option_value), autoload = 'no'",
+            $key,
+            $value
         );
-        error_log( '[KS Migration] _write_media_checkpoint: job=' . $job_id . ' files=' . count( $uploaded ) . ' bytes=' . $bytes_uploaded . ' rows=' . (int) $rows . ' wpdb_err=' . ( $wpdb->last_error ?: 'none' ) );
+        $ok    = (bool) mysqli_query( $wpdb->dbh, $sql );
+        $rows  = $ok ? (int) mysqli_affected_rows( $wpdb->dbh ) : 0;
+        $err   = $ok ? 'none' : ( mysqli_error( $wpdb->dbh ) ?: 'unknown' );
+        error_log( '[KS Migration] _write_media_checkpoint: job=' . $job_id . ' files=' . count( $uploaded ) . ' bytes=' . $bytes_uploaded . ' rows=' . $rows . ' mysqli_err=' . $err );
     }
 
     /**
@@ -1173,7 +1189,11 @@ class KloudStack_Migration_BackgroundExport {
      */
     private static function _delete_media_checkpoint( string $job_id ): void {
         global $wpdb;
-        $wpdb->delete( $wpdb->options, [ 'option_name' => self::_ckpt_option_key( $job_id ) ] );
+        $sql = $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name = %s",
+            self::_ckpt_option_key( $job_id )
+        );
+        mysqli_query( $wpdb->dbh, $sql );
     }
 
     /**
