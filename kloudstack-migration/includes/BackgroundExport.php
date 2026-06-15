@@ -1125,20 +1125,26 @@ class KloudStack_Migration_BackgroundExport {
      */
     private static function _read_media_checkpoint( string $job_id ): array {
         global $wpdb;
+        $key = self::_ckpt_option_key( $job_id );
         $row = $wpdb->get_var( $wpdb->prepare(
             "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-            self::_ckpt_option_key( $job_id )
+            $key
         ) );
         if ( ! $row ) {
+            error_log( '[KS Migration] _read_media_checkpoint: NO ROW job=' . $job_id . ' key=' . $key . ' wpdb_err=' . ( $wpdb->last_error ?: 'none' ) );
             return [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
         }
         $data = maybe_unserialize( $row );
-        return is_array( $data )
-            ? [
-                'uploaded_files' => is_array( $data['uploaded_files'] ?? null ) ? $data['uploaded_files'] : [],
-                'bytes_uploaded' => (int) ( $data['bytes_uploaded'] ?? 0 ),
-            ]
-            : [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
+        if ( ! is_array( $data ) ) {
+            error_log( '[KS Migration] _read_media_checkpoint: UNSERIALIZE FAILED job=' . $job_id . ' row_len=' . strlen( $row ) );
+            return [ 'uploaded_files' => [], 'bytes_uploaded' => 0 ];
+        }
+        $files_count = isset( $data['uploaded_files'] ) && is_array( $data['uploaded_files'] ) ? count( $data['uploaded_files'] ) : 0;
+        error_log( '[KS Migration] _read_media_checkpoint: OK job=' . $job_id . ' files=' . $files_count . ' bytes=' . ( $data['bytes_uploaded'] ?? 0 ) );
+        return [
+            'uploaded_files' => is_array( $data['uploaded_files'] ?? null ) ? $data['uploaded_files'] : [],
+            'bytes_uploaded' => (int) ( $data['bytes_uploaded'] ?? 0 ),
+        ];
     }
 
     /**
@@ -1147,10 +1153,11 @@ class KloudStack_Migration_BackgroundExport {
      */
     private static function _write_media_checkpoint( string $job_id, array $uploaded, int $bytes_uploaded ): void {
         global $wpdb;
-        $wpdb->replace(
+        $key  = self::_ckpt_option_key( $job_id );
+        $rows = $wpdb->replace(
             $wpdb->options,
             [
-                'option_name'  => self::_ckpt_option_key( $job_id ),
+                'option_name'  => $key,
                 'option_value' => maybe_serialize( [
                     'uploaded_files' => $uploaded,
                     'bytes_uploaded' => $bytes_uploaded,
@@ -1158,6 +1165,7 @@ class KloudStack_Migration_BackgroundExport {
                 'autoload'     => 'no',
             ]
         );
+        error_log( '[KS Migration] _write_media_checkpoint: job=' . $job_id . ' files=' . count( $uploaded ) . ' bytes=' . $bytes_uploaded . ' rows=' . (int) $rows . ' wpdb_err=' . ( $wpdb->last_error ?: 'none' ) );
     }
 
     /**

@@ -1148,6 +1148,27 @@ class KloudStack_Migration_RestEndpoints {
             $audit_option
         ) );
 
+        // Media upload checkpoint (v1.8.0+): dedicated wp_options entry that bypasses
+        // the object cache entirely. Shows whether the checkpoint was written and how many
+        // files it contains — the key diagnostic for the 20% stall.
+        $ckpt_key  = 'ks_mig_ckpt_' . $job_id;
+        $ckpt_raw  = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            $ckpt_key
+        ) );
+        $ckpt_data       = $ckpt_raw ? maybe_unserialize( $ckpt_raw ) : null;
+        $ckpt_files      = is_array( $ckpt_data ) && isset( $ckpt_data['uploaded_files'] )
+            ? count( $ckpt_data['uploaded_files'] )
+            : null;
+        $ckpt_bytes      = is_array( $ckpt_data ) ? ( $ckpt_data['bytes_uploaded'] ?? null ) : null;
+        $ckpt_wpdb_error = $wpdb->last_error ?: null;
+
+        // Checkpoint write round-trip test — confirms ks_mig_ckpt_ REPLACE works right now.
+        $ckpt_test_key = 'ks_mig_ckpt_test_' . $job_id;
+        $wpdb->replace( $wpdb->options, [ 'option_name' => $ckpt_test_key, 'option_value' => 'ckpt_ok', 'autoload' => 'no' ] );
+        $ckpt_test_read = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $ckpt_test_key ) );
+        $wpdb->delete( $wpdb->options, [ 'option_name' => $ckpt_test_key ] );
+
         return new WP_REST_Response( [
             'job_id'                 => $job_id,
             'plugin_version'         => defined( 'KLOUDSTACK_MIGRATION_VERSION' ) ? KLOUDSTACK_MIGRATION_VERSION : 'unknown',
@@ -1162,6 +1183,12 @@ class KloudStack_Migration_RestEndpoints {
             'job_in_queue'           => $job_in_queue,
             'db_write_roundtrip'     => ( $test_read === 'ok' ? 'pass' : 'fail' ),
             'db_update_roundtrip'    => ( $update_test_read === 'updated' ? 'pass' : 'fail' ),
+            'ckpt_row_exists'        => ( null !== $ckpt_raw ),
+            'ckpt_files_count'       => $ckpt_files,
+            'ckpt_bytes_uploaded'    => $ckpt_bytes,
+            'ckpt_unserialize_ok'    => is_array( $ckpt_data ),
+            'ckpt_wpdb_error'        => $ckpt_wpdb_error,
+            'ckpt_write_roundtrip'   => ( $ckpt_test_read === 'ckpt_ok' ? 'pass' : 'fail' ),
             'ext_object_cache'       => wp_using_ext_object_cache(),
             'php_version'            => PHP_VERSION,
             'timestamp'              => time(),
