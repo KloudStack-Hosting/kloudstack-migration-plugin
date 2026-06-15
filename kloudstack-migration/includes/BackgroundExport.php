@@ -955,12 +955,32 @@ class KloudStack_Migration_BackgroundExport {
                 return;
             }
             $job = array_merge( $job, $updates );
-            $rows = $wpdb->update(
+            // Use REPLACE (INSERT OR UPDATE) instead of UPDATE so the write succeeds even
+            // when the MySQL user lacks UPDATE privilege — observed on some managed hosts
+            // where db_write_roundtrip (which uses replace) passes but update returns 0.
+            $rows = $wpdb->replace(
                 $wpdb->options,
-                [ 'option_value' => maybe_serialize( $job ) ],
-                [ 'option_name'  => $option_name ]
+                [
+                    'option_name'  => $option_name,
+                    'option_value' => maybe_serialize( $job ),
+                    'autoload'     => 'no',
+                ]
             );
             error_log( '[KS Migration] _update_job DB-fallback: ' . $job_id . ' rows_affected=' . $rows . ' progress=' . ( $updates['progress'] ?? '?' ) . ' status=' . ( $updates['status'] ?? '?' ) . ' wpdb_err=' . $wpdb->last_error );
+            // Write audit entry accessible via /job-debug so we can see the DB write
+            // result remotely without needing access to the WordPress debug.log file.
+            $wpdb->replace( $wpdb->options, [
+                'option_name'  => 'ks_mig_audit_' . substr( $job_id, -12 ),
+                'option_value' => json_encode( [
+                    'job_id'  => $job_id,
+                    'path'    => 'db_fallback',
+                    'updates' => $updates,
+                    'rows'    => $rows,
+                    'err'     => $wpdb->last_error ?: null,
+                    'ts'      => time(),
+                ] ),
+                'autoload'     => 'no',
+            ] );
             // Bust any stale in-memory option cache so the next get_transient() / get_option()
             // reads the fresh DB value rather than a cached 0% snapshot.
             wp_cache_delete( $option_name, 'options' );
@@ -969,14 +989,27 @@ class KloudStack_Migration_BackgroundExport {
 
         $job = array_merge( $job, $updates );
         set_transient( $transient_key, $job, KloudStack_Migration_RestEndpoints::JOB_TTL );
-        // Mirror the update into wp_options so the shadow copy (_shadow_write_transient) stays
-        // in sync. This ensures the DB-fallback path (above) always sees the latest value
-        // even after many _update_job() calls in a long-running shutdown context.
-        $wpdb->update(
+        // Mirror into wp_options using REPLACE so the write succeeds even when the MySQL
+        // user lacks UPDATE privilege (same fix as the DB-fallback path above).
+        $wpdb->replace(
             $wpdb->options,
-            [ 'option_value' => maybe_serialize( $job ) ],
-            [ 'option_name'  => $option_name ]
+            [
+                'option_name'  => $option_name,
+                'option_value' => maybe_serialize( $job ),
+                'autoload'     => 'no',
+            ]
         );
+        // Audit entry for primary path too (helps distinguish which path ran in logs).
+        $wpdb->replace( $wpdb->options, [
+            'option_name'  => 'ks_mig_audit_' . substr( $job_id, -12 ),
+            'option_value' => json_encode( [
+                'job_id'  => $job_id,
+                'path'    => 'primary',
+                'updates' => $updates,
+                'ts'      => time(),
+            ] ),
+            'autoload'     => 'no',
+        ] );
     }
 
     private static function _job_status( string $job_id ): string {

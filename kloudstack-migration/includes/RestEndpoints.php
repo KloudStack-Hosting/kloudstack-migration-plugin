@@ -1128,6 +1128,21 @@ class KloudStack_Migration_RestEndpoints {
         $test_read = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $test_key ) );
         $wpdb->delete( $wpdb->options, [ 'option_name' => $test_key ] );
 
+        // DB write round-trip test using UPDATE specifically — distinguishes hosts where
+        // INSERT/REPLACE works but UPDATE privilege is absent (the root cause of 0%-stall).
+        $update_test_key = '_ks_dbtest_upd_' . time();
+        $wpdb->replace( $wpdb->options, [ 'option_name' => $update_test_key, 'option_value' => 'initial', 'autoload' => 'no' ] );
+        $wpdb->update( $wpdb->options, [ 'option_value' => 'updated' ], [ 'option_name' => $update_test_key ] );
+        $update_test_read = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", $update_test_key ) );
+        $wpdb->delete( $wpdb->options, [ 'option_name' => $update_test_key ] );
+
+        // Last _update_job() audit entry (written by BackgroundExport::_update_job()).
+        $audit_option = 'ks_mig_audit_' . substr( $job_id, -12 );
+        $audit_raw    = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            $audit_option
+        ) );
+
         return new WP_REST_Response( [
             'job_id'                 => $job_id,
             'plugin_version'         => defined( 'KLOUDSTACK_MIGRATION_VERSION' ) ? KLOUDSTACK_MIGRATION_VERSION : 'unknown',
@@ -1141,9 +1156,11 @@ class KloudStack_Migration_RestEndpoints {
             'queue_depth'            => count( $queue ),
             'job_in_queue'           => $job_in_queue,
             'db_write_roundtrip'     => ( $test_read === 'ok' ? 'pass' : 'fail' ),
+            'db_update_roundtrip'    => ( $update_test_read === 'updated' ? 'pass' : 'fail' ),
             'ext_object_cache'       => wp_using_ext_object_cache(),
             'php_version'            => PHP_VERSION,
             'timestamp'              => time(),
+            'last_update_audit'      => $audit_raw ? json_decode( $audit_raw, true ) : null,
         ], 200 );
     }
 
