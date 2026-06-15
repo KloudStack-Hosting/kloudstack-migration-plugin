@@ -174,9 +174,16 @@ class KloudStack_Migration_BackgroundExport {
                 $sas_url = $item['sas_url'];
 
                 // Load agent-provided hints stored when the job was queued.
-                // On retries after a failure the backend may include adjusted parameters
-                // (e.g. stream_rate_limit_kbps after a CPU spike or skip_extensions after an OOM).
-                $job_transient = get_transient( KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id );
+                // DB fallback mirrors _update_job(): object cache may be closed in shutdown.
+                $hints_key     = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
+                $job_transient = get_transient( $hints_key );
+                if ( false === $job_transient ) {
+                    $db_val        = $wpdb->get_var( $wpdb->prepare(
+                        "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                        '_transient_' . $hints_key
+                    ) );
+                    $job_transient = $db_val ? maybe_unserialize( $db_val ) : null;
+                }
                 $hints = ( is_array( $job_transient ) && isset( $job_transient['hints'] ) && is_array( $job_transient['hints'] ) )
                     ? $job_transient['hints']
                     : [];
@@ -457,6 +464,7 @@ class KloudStack_Migration_BackgroundExport {
         string $sas_token,
         array $hints = []
     ): bool {
+        global $wpdb;
         error_log( '[KS Migration] _run_media_stream: START job=' . $job_id . ' container=' . $container_base_url . ' prefix=' . $blob_prefix . ' sas_len=' . strlen( $sas_token ) );
 
         // Validate the container base URL points to Azure Blob Storage over HTTPS.
@@ -488,8 +496,21 @@ class KloudStack_Migration_BackgroundExport {
         $batch_size = 500;
 
         // Load checkpoint — list of relative paths already uploaded this job.
+        // Uses the same DB fallback as _update_job(): in shutdown context (after
+        // fastcgi_finish_request) WordPress's do_action('shutdown') closes the object
+        // cache (APCu / W3TC / Redis) BEFORE our shutdown function fires (PHP FIFO).
+        // get_transient() then returns false, losing the checkpoint and forcing the job
+        // to re-process from file 0 every cron tick — causing permanent 20% stall.
         $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
         $job_data      = get_transient( $transient_key );
+        if ( false === $job_data ) {
+            $db_val   = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                '_transient_' . $transient_key
+            ) );
+            $job_data = $db_val ? maybe_unserialize( $db_val ) : null;
+            error_log( '[KS Migration] _run_media_stream: checkpoint DB-fallback job=' . $job_id . ' found=' . ( null !== $job_data ? 'yes' : 'no' ) );
+        }
         $uploaded      = isset( $job_data['uploaded_files'] ) && is_array( $job_data['uploaded_files'] )
             ? $job_data['uploaded_files']
             : [];
