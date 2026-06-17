@@ -600,12 +600,14 @@ class KloudStack_Migration_RestEndpoints {
      * @return WP_REST_Response
      */
     public static function export_site_content( WP_REST_Request $request ): WP_REST_Response {
-        $params   = $request->get_json_params();
-        $sas_urls = $params['sas_urls'] ?? [];
-        $hints    = self::_sanitize_hints( $params['hints'] ?? [] );
+        $params        = $request->get_json_params();
+        $sas_urls      = $params['sas_urls'] ?? [];
+        $container_sas = $params['container_sas'] ?? [];
+        $hints         = self::_sanitize_hints( $params['hints'] ?? [] );
 
-        if ( ! is_array( $sas_urls ) || empty( $sas_urls ) ) {
-            return new WP_REST_Response( [ 'error' => 'sas_urls is required and must be a non-empty object.' ], 400 );
+        if ( ( ! is_array( $sas_urls ) || empty( $sas_urls ) ) &&
+             ( ! is_array( $container_sas ) || empty( $container_sas ) ) ) {
+            return new WP_REST_Response( [ 'error' => 'sas_urls or container_sas is required and must be a non-empty object.' ], 400 );
         }
 
         // Resolve artifact name → absolute filesystem path.
@@ -621,49 +623,126 @@ class KloudStack_Migration_RestEndpoints {
 
         $jobs = [];
 
-        foreach ( $sas_urls as $artifact => $sas_url ) {
-            // Reject unknown artifact names
-            if ( ! array_key_exists( $artifact, $artifact_paths ) ) {
-                continue;
+        // --- Per-file streaming (v1.9.0): container_sas artifacts (plugins, themes, mu-plugins) ---
+        if ( is_array( $container_sas ) ) {
+            foreach ( $container_sas as $artifact => $sas_data ) {
+                if ( ! array_key_exists( $artifact, $artifact_paths ) ) {
+                    continue;
+                }
+
+                $source_path = $artifact_paths[ $artifact ];
+
+                // content_stream does not support custom-root (stays ZIP via content_export).
+                if ( 'custom-root' === $source_path ) {
+                    continue;
+                }
+
+                // Skip if the directory doesn't exist on this site.
+                if ( ! is_dir( $source_path ) ) {
+                    continue;
+                }
+
+                if ( ! is_array( $sas_data ) ) {
+                    continue;
+                }
+
+                $container_base_url = sanitize_url( $sas_data['container_base_url'] ?? '' );
+                $blob_prefix        = sanitize_text_field( $sas_data['blob_prefix'] ?? '' );
+                // Do NOT use sanitize_text_field() on the SAS token — it strips %XX
+                // percent-encoded characters and corrupts the Azure signature (same
+                // issue as upload_media endpoint, fixed in v1.7.8).
+                $sas_token = (string) ( $sas_data['sas_token'] ?? '' );
+
+                if ( empty( $container_base_url ) || empty( $blob_prefix ) || empty( $sas_token ) ) {
+                    continue;
+                }
+
+                $job_id = 'content_' . sanitize_key( $artifact ) . '_' . wp_generate_uuid4();
+
+                $job = [
+                    'type'               => 'content_stream',
+                    'status'             => 'queued',
+                    'progress'           => 0,
+                    'sas_url'            => '',
+                    'container_base_url' => $container_base_url,
+                    'blob_prefix'        => $blob_prefix,
+                    'sas_token'          => $sas_token,
+                    'source_path'        => $source_path,
+                    'artifact'           => $artifact,
+                    'hints'              => $hints,
+                    'created_at'         => time(),
+                    'error'              => null,
+                ];
+
+                set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
+                self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
+
+                KloudStack_Migration_BackgroundExport::enqueue(
+                    $job_id,
+                    'content_stream',
+                    '',
+                    [
+                        'container_base_url' => $container_base_url,
+                        'blob_prefix'        => $blob_prefix,
+                        'sas_token'          => $sas_token,
+                        'source_path'        => $source_path,
+                        'artifact'           => $artifact,
+                    ]
+                );
+
+                $jobs[ $artifact ] = $job_id;
             }
+        }
 
-            $source_path = $artifact_paths[ $artifact ];
+        // --- ZIP-based fallback (content_export): sas_urls artifacts (custom-root + backward compat) ---
+        if ( is_array( $sas_urls ) ) {
+            foreach ( $sas_urls as $artifact => $sas_url ) {
+                if ( ! array_key_exists( $artifact, $artifact_paths ) ) {
+                    continue;
+                }
 
-            // Skip artifacts whose directory doesn't exist (e.g. mu-plugins on a stock site)
-            if ( 'custom-root' !== $source_path && ! is_dir( $source_path ) ) {
-                continue;
+                // Skip artifacts already queued via container_sas (streaming takes priority).
+                if ( isset( $jobs[ $artifact ] ) ) {
+                    continue;
+                }
+
+                $source_path = $artifact_paths[ $artifact ];
+
+                if ( 'custom-root' !== $source_path && ! is_dir( $source_path ) ) {
+                    continue;
+                }
+
+                $sas_url = sanitize_url( $sas_url );
+                $job_id  = 'content_' . sanitize_key( $artifact ) . '_' . wp_generate_uuid4();
+
+                $job = [
+                    'type'        => 'content_export',
+                    'status'      => 'queued',
+                    'progress'    => 0,
+                    'sas_url'     => $sas_url,
+                    'source_path' => $source_path,
+                    'artifact'    => $artifact,
+                    'hints'       => $hints,
+                    'created_at'  => time(),
+                    'error'       => null,
+                ];
+
+                set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
+                self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
+
+                KloudStack_Migration_BackgroundExport::enqueue(
+                    $job_id,
+                    'content_export',
+                    $sas_url,
+                    [ 'source_path' => $source_path, 'artifact' => $artifact ]
+                );
+
+                $jobs[ $artifact ] = $job_id;
             }
-
-            $sas_url = sanitize_url( $sas_url );
-            $job_id  = 'content_' . sanitize_key( $artifact ) . '_' . wp_generate_uuid4();
-
-            $job = [
-                'type'        => 'content_export',
-                'status'      => 'queued',
-                'progress'    => 0,
-                'sas_url'     => $sas_url,
-                'source_path' => $source_path,
-                'artifact'    => $artifact,
-                'hints'       => $hints,
-                'created_at'  => time(),
-                'error'       => null,
-            ];
-
-            set_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job, self::JOB_TTL );
-            self::_shadow_write_transient( self::JOB_TRANSIENT_PREFIX . $job_id, $job );
-
-            KloudStack_Migration_BackgroundExport::enqueue(
-                $job_id,
-                'content_export',
-                $sas_url,
-                [ 'source_path' => $source_path, 'artifact' => $artifact ]
-            );
-
-            $jobs[ $artifact ] = $job_id;
         }
 
         if ( empty( $jobs ) ) {
-            return new WP_REST_Response( [ 'error' => 'No valid artifact paths found for the requested sas_urls.' ], 422 );
+            return new WP_REST_Response( [ 'error' => 'No valid artifact paths found for the requested artifacts.' ], 422 );
         }
 
         // Flush the 202 response, then kick the queue in the same PHP-FPM worker.

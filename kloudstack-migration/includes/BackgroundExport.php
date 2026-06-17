@@ -207,6 +207,13 @@ class KloudStack_Migration_BackgroundExport {
                     } elseif ( 'content_export' === $type ) {
                         $source_path = $item['source_path'] ?? '';
                         $success = self::_run_content_export( $job_id, $sas_url, $source_path, $hints );
+                    } elseif ( 'content_stream' === $type ) {
+                        $container_base_url = $item['container_base_url'] ?? '';
+                        $blob_prefix        = $item['blob_prefix'] ?? '';
+                        $sas_token          = $item['sas_token'] ?? '';
+                        $source_path        = $item['source_path'] ?? '';
+                        $artifact           = $item['artifact'] ?? '';
+                        $success = self::_run_content_stream( $job_id, $container_base_url, $blob_prefix, $sas_token, $source_path, $artifact, $hints );
                     }
                 } catch ( Exception $e ) {
                     self::_update_job( $job_id, [
@@ -924,6 +931,213 @@ class KloudStack_Migration_BackgroundExport {
                 unlink( $tmp_zip );
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Content streaming (per-file, checkpointed — v1.9.0)
+    // ------------------------------------------------------------------
+
+    /**
+     * Stream every file in a wp-content sub-directory to Azure Blob Storage.
+     *
+     * Per-file PUT with checkpoint — mirrors _run_media_stream() for the plugins,
+     * themes, and mu-plugins directories.  Eliminates the single-pass ZIP bottleneck
+     * that caused PHP timeout stalls on GoDaddy and other hosts with strict wall-clock
+     * limits on background PHP processes.
+     *
+     * Batch size: 200 files per WP-Cron tick (content files tend to be larger than
+     * media thumbnails, keeping each batch safely under GoDaddy's timeout).
+     *
+     * Checkpoint reuse: _read_media_checkpoint / _write_media_checkpoint /
+     * _delete_media_checkpoint use ks_mig_ckpt_<job_id> — unique per job, so content
+     * stream jobs reuse the same raw-mysqli checkpoint machinery without conflict.
+     *
+     * @param string $job_id
+     * @param string $container_base_url  Azure Blob container URL (HTTPS)
+     * @param string $blob_prefix         Blob path prefix, e.g. migrations/{id}/content/plugins
+     * @param string $sas_token           Container-level write SAS (no leading ?)
+     * @param string $source_path         Absolute filesystem path to the source directory
+     * @param string $artifact            Artifact name for logging ('plugins', 'themes', 'mu-plugins')
+     * @param array  $hints               Agent hints (skip_extensions, max_file_size_mb)
+     * @return bool true when complete, false to re-queue for next tick
+     * @throws Exception on unrecoverable failure
+     */
+    private static function _run_content_stream(
+        string $job_id,
+        string $container_base_url,
+        string $blob_prefix,
+        string $sas_token,
+        string $source_path,
+        string $artifact,
+        array $hints = []
+    ): bool {
+        error_log( '[KS Migration] _run_content_stream: START job=' . $job_id . ' artifact=' . $artifact . ' source=' . $source_path . ' prefix=' . $blob_prefix );
+
+        if ( 0 !== strpos( $container_base_url, 'https://' ) ) {
+            throw new Exception( 'container_base_url must use HTTPS.' );
+        }
+        if ( false === strpos( parse_url( $container_base_url, PHP_URL_HOST ) ?? '', '.blob.core.windows.net' ) ) {
+            throw new Exception( 'container_base_url host is not a trusted Azure Blob endpoint.' );
+        }
+
+        if ( ! is_dir( $source_path ) ) {
+            throw new Exception( "Source directory does not exist: {$source_path}" );
+        }
+
+        $skip_extensions = isset( $hints['skip_extensions'] ) && is_array( $hints['skip_extensions'] )
+            ? array_map( 'strtolower', $hints['skip_extensions'] )
+            : [];
+        $max_size_bytes  = isset( $hints['max_file_size_mb'] ) && $hints['max_file_size_mb'] > 0
+            ? ( (int) $hints['max_file_size_mb'] ) * 1024 * 1024
+            : 0;
+
+        // WordPress drop-in files are environment-specific (credentials, paths for the
+        // source server).  These shouldn't appear inside plugins/ or themes/ but we
+        // exclude them defensively to avoid PHP fatal errors on the target environment.
+        $excluded_filenames = [ 'db.php', 'advanced-cache.php', 'object-cache.php', 'db-error.php', 'maintenance.php' ];
+
+        // 200 files per tick — smaller than media (500) because plugin PHP/JS/CSS files
+        // average larger than image thumbnails, keeping each batch under safe limits on
+        // restricted hosts like GoDaddy.
+        $batch_size = 200;
+
+        // Load checkpoint — list of relative paths already uploaded this job.
+        // Reuses _read_media_checkpoint() / _write_media_checkpoint() since the checkpoint
+        // key (ks_mig_ckpt_<job_id>) is unique per job regardless of job type.
+        $ckpt           = self::_read_media_checkpoint( $job_id );
+        $uploaded       = $ckpt['uploaded_files'];
+        $bytes_uploaded = $ckpt['bytes_uploaded'];
+        $uploaded_set   = array_flip( $uploaded );
+        error_log( '[KS Migration] _run_content_stream: checkpoint loaded job=' . $job_id . ' already_uploaded=' . count( $uploaded ) . ' bytes=' . $bytes_uploaded );
+
+        // Enumerate all files recursively in $source_path.
+        $all_files = [];
+        $iterator  = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $source_path, FilesystemIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+        foreach ( $iterator as $file ) {
+            if ( ! $file->isFile() ) {
+                continue;
+            }
+            if ( in_array( $file->getFilename(), $excluded_filenames, true ) ) {
+                continue;
+            }
+            if ( $skip_extensions ) {
+                $ext = strtolower( pathinfo( $file->getFilename(), PATHINFO_EXTENSION ) );
+                if ( in_array( '.' . $ext, $skip_extensions, true ) || in_array( $ext, $skip_extensions, true ) ) {
+                    continue;
+                }
+            }
+            if ( $max_size_bytes > 0 && $file->getSize() > $max_size_bytes ) {
+                continue;
+            }
+            $all_files[] = [
+                'abs'  => $file->getPathname(),
+                'rel'  => str_replace( $source_path . DIRECTORY_SEPARATOR, '', $file->getPathname() ),
+                'size' => $file->getSize(),
+            ];
+        }
+
+        $total_files = count( $all_files );
+        $total_bytes = array_sum( array_column( $all_files, 'size' ) );
+
+        error_log( '[KS Migration] _run_content_stream: enumerated total_files=' . $total_files . ' total_bytes=' . $total_bytes . ' artifact=' . $artifact );
+
+        if ( 0 === $total_files ) {
+            error_log( '[KS Migration] _run_content_stream: no files found — marking complete immediately' );
+        }
+
+        self::_update_job( $job_id, [
+            'total_files' => $total_files,
+            'total_bytes' => $total_bytes,
+        ] );
+
+        $files_this_batch    = 0;
+        $checkpoint_interval = 50;
+
+        foreach ( $all_files as $entry ) {
+            $rel_path = $entry['rel'];
+
+            if ( isset( $uploaded_set[ $rel_path ] ) ) {
+                continue;
+            }
+
+            // Normalise to forward-slash for the blob name.
+            $blob_rel  = str_replace( DIRECTORY_SEPARATOR, '/', $rel_path );
+            $blob_name = "{$blob_prefix}/{$blob_rel}";
+            $blob_url  = "{$container_base_url}/{$blob_name}?{$sas_token}";
+
+            $mime_type = 'application/octet-stream';
+            if ( function_exists( 'mime_content_type' ) ) {
+                $detected = mime_content_type( $entry['abs'] );
+                if ( $detected ) {
+                    $mime_type = $detected;
+                }
+            }
+
+            if ( 1 === $files_this_batch + 1 ) {
+                error_log( '[KS Migration] _run_content_stream: uploading first file=' . $blob_rel . ' size=' . $entry['size'] );
+            }
+            self::_upload_blob_put( $blob_url, $entry['abs'], $mime_type );
+
+            $uploaded[]              = $rel_path;
+            $uploaded_set[$rel_path] = true;
+            $bytes_uploaded         += $entry['size'];
+            $files_this_batch++;
+
+            $progress = $total_files > 0
+                ? max( 1, min( 99, (int) ( count( $uploaded ) / $total_files * 99 ) ) )
+                : 99;
+            self::_update_job( $job_id, [
+                'progress'       => $progress,
+                'files_uploaded' => count( $uploaded ),
+                'bytes_uploaded' => $bytes_uploaded,
+                'message'        => $blob_rel,
+            ] );
+
+            if ( 0 === $files_this_batch % $checkpoint_interval ) {
+                self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
+            }
+
+            if ( $files_this_batch >= $batch_size ) {
+                self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
+                self::_update_job( $job_id, [ 'status' => 'processing' ] );
+                return false;
+            }
+        }
+
+        // All files uploaded — write _manifest.json as the completion signal.
+        // Unlike media (which strips /uploads), the manifest lands directly at
+        // {blob_prefix}/_manifest.json so get_content_manifest() on the server
+        // can check migrations/{id}/content/{artifact}/_manifest.json.
+        $manifest = json_encode( [
+            'artifact'     => $artifact,
+            'total_files'  => $total_files,
+            'total_bytes'  => $total_bytes,
+            'completed_at' => time(),
+        ] );
+        $manifest_url = "{$container_base_url}/{$blob_prefix}/_manifest.json?{$sas_token}";
+
+        $tmp_manifest = tempnam( sys_get_temp_dir(), 'ks_manifest_' ) . '.json';
+        try {
+            file_put_contents( $tmp_manifest, $manifest );
+            self::_upload_blob_put( $manifest_url, $tmp_manifest, 'application/json' );
+        } finally {
+            if ( file_exists( $tmp_manifest ) ) {
+                unlink( $tmp_manifest );
+            }
+        }
+
+        self::_update_job( $job_id, [
+            'progress'       => 100,
+            'files_uploaded' => $total_files,
+            'bytes_uploaded' => $total_bytes,
+        ] );
+
+        self::_delete_media_checkpoint( $job_id );
+
+        return true;
     }
 
     // ------------------------------------------------------------------
