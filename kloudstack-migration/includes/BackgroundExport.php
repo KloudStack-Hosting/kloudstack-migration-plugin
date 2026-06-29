@@ -579,6 +579,13 @@ class KloudStack_Migration_BackgroundExport {
         // serialise so we batch it every N files to avoid O(N²) write traffic.
         $checkpoint_interval = 50;
 
+        // Wall-clock guard: yield before the host's PHP max_execution_time so a
+        // large library is never killed mid-batch before a checkpoint is written
+        // (count-based batching alone can blow the time limit on slow uploads).
+        $max_exec    = (int) ini_get( 'max_execution_time' );
+        $time_budget = $max_exec > 0 ? max( 10, (int) floor( $max_exec * 0.8 ) ) : 45;
+        $start_time  = microtime( true );
+
         foreach ( $all_files as $entry ) {
             $rel_path = $entry['rel'];
 
@@ -632,8 +639,9 @@ class KloudStack_Migration_BackgroundExport {
                 self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
             }
 
-            // Yield after the batch limit to allow WP-Cron to reschedule.
-            if ( $files_this_batch >= $batch_size ) {
+            // Yield after the batch limit OR the time budget to allow WP-Cron to reschedule.
+            if ( $files_this_batch >= $batch_size
+                || ( microtime( true ) - $start_time ) >= $time_budget ) {
                 // Flush the final checkpoint directly to wp_options before exiting so the
                 // next cron tick resumes from where we stopped (bypasses external cache).
                 self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
@@ -1056,6 +1064,17 @@ class KloudStack_Migration_BackgroundExport {
         $files_this_batch    = 0;
         $checkpoint_interval = 50;
 
+        // Wall-clock guard: yield (checkpoint + return) before the host's PHP
+        // max_execution_time. Count-based batching alone is not safe — a heavy
+        // plugin (e.g. wpdatatables/PhpSpreadsheet: hundreds of per-file PUTs)
+        // can exceed the time limit mid-batch and be killed BEFORE a checkpoint
+        // is written, leaving the job to resume from the same point forever
+        // (the indefinite export_media stall). Yielding on time guarantees each
+        // cron tick persists durable progress.
+        $max_exec    = (int) ini_get( 'max_execution_time' );
+        $time_budget = $max_exec > 0 ? max( 10, (int) floor( $max_exec * 0.8 ) ) : 45;
+        $start_time  = microtime( true );
+
         foreach ( $all_files as $entry ) {
             $rel_path = $entry['rel'];
 
@@ -1100,7 +1119,8 @@ class KloudStack_Migration_BackgroundExport {
                 self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
             }
 
-            if ( $files_this_batch >= $batch_size ) {
+            if ( $files_this_batch >= $batch_size
+                || ( microtime( true ) - $start_time ) >= $time_budget ) {
                 self::_write_media_checkpoint( $job_id, $uploaded, $bytes_uploaded );
                 self::_update_job( $job_id, [ 'status' => 'processing' ] );
                 return false;

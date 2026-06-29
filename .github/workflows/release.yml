@@ -19,14 +19,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Read the version directly from the plugin PHP header so the tag
-      # and the plugin file are always kept in sync.
-      - name: Read plugin version
+      # The git tag is the single source of truth for the version. Stamp it into
+      # the plugin PHP file (header + KLOUDSTACK_MIGRATION_VERSION constant) so the
+      # released ZIP always matches the tag — no manual file bump before tagging.
+      - name: Stamp version from tag
         id: version
         run: |
-          VERSION=$(grep -oP '(?<=\* Version:\s{5})\S+' kloudstack-migration/kloudstack-migration.php)
+          VERSION="${GITHUB_REF_NAME#v}"   # v1.9.1 -> 1.9.1
+          FILE=kloudstack-migration/kloudstack-migration.php
+          sed -i -E "s/^( \* Version:[[:space:]]*).*/\1${VERSION}/" "$FILE"
+          sed -i -E "s/(define\(\s*'KLOUDSTACK_MIGRATION_VERSION',\s*')[^']*(')/\1${VERSION}\2/" "$FILE"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Plugin version: $VERSION"
+          echo "Stamped plugin version: $VERSION"
+          grep -nE 'Version:|KLOUDSTACK_MIGRATION_VERSION' "$FILE"
 
       # Compress the plugin folder so WordPress can unzip it as
       # wp-content/plugins/kloudstack-migration/

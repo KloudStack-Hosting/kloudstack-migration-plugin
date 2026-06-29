@@ -2,6 +2,11 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.9.1] - 2026-06-29
+
+### Fixed
+- **export_media stall on large plugins**: `BackgroundExport::_run_content_stream()` and `_run_media_stream()` now yield (checkpoint + reschedule) on a **wall-clock time budget** derived from the host's `max_execution_time`, not just a fixed file count. A heavy plugin such as `wpdatatables` (which bundles the PhpSpreadsheet library — hundreds of per-file uploads) could previously exceed the PHP execution limit mid-batch and be killed *before* a checkpoint was written, causing the content export job to resume from the same point on every WP-Cron tick and **stall indefinitely**. The time guard guarantees durable incremental progress on every tick.
+
 ## [1.4.0] - 2026-06-05
 
 ### Changed
