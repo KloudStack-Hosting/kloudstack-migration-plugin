@@ -2,6 +2,11 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.9.3] - 2026-06-29
+
+### Fixed
+- **Content/media upload fails on filenames with special characters**: `_run_content_stream()` and `_run_media_stream()` built the Azure Blob PUT URL by raw string interpolation of the file path, so any file with a space or URL-illegal character (e.g. brackets in PhpSpreadsheet fixtures such as `[Content_Types].xml`, or media files with spaces) produced a malformed URL and cURL aborted the **entire** content/media job with `URL using bad/illegal format or missing URL`. Each path segment is now `rawurlencode`d (preserving `/`); the blob is still stored under its real decoded name (Azure decodes the URL path).
+
 ## [1.9.2] - 2026-06-29
 
 ### Changed

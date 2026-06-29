@@ -642,7 +642,14 @@ class KloudStack_Migration_BackgroundExport {
             // Normalise path separators to forward-slash for the blob name.
             $blob_rel  = str_replace( DIRECTORY_SEPARATOR, '/', $rel_path );
             $blob_name = "{$blob_prefix}/{$blob_rel}";
-            $blob_url  = "{$container_base_url}/{$blob_name}?{$sas_token}";
+            // URL-encode each path segment (preserve '/') so files with spaces or
+            // special characters (e.g. brackets in PhpSpreadsheet fixtures such as
+            // "[Content_Types].xml") produce a valid URL. cURL otherwise rejects the
+            // unencoded illegal characters with "URL using bad/illegal format or
+            // missing URL" and the whole content/media job fails. The blob is still
+            // stored under its real (decoded) name — Azure decodes the URL path.
+            $blob_path = implode( '/', array_map( 'rawurlencode', explode( '/', $blob_name ) ) );
+            $blob_url  = "{$container_base_url}/{$blob_path}?{$sas_token}";
 
             // Detect MIME type for accurate Content-Type header.
             $mime_type = 'application/octet-stream';
@@ -1136,7 +1143,14 @@ class KloudStack_Migration_BackgroundExport {
             // Normalise to forward-slash for the blob name.
             $blob_rel  = str_replace( DIRECTORY_SEPARATOR, '/', $rel_path );
             $blob_name = "{$blob_prefix}/{$blob_rel}";
-            $blob_url  = "{$container_base_url}/{$blob_name}?{$sas_token}";
+            // URL-encode each path segment (preserve '/') so files with spaces or
+            // special characters (e.g. brackets in PhpSpreadsheet fixtures such as
+            // "[Content_Types].xml") produce a valid URL. cURL otherwise rejects the
+            // unencoded illegal characters with "URL using bad/illegal format or
+            // missing URL" and the whole content/media job fails. The blob is still
+            // stored under its real (decoded) name — Azure decodes the URL path.
+            $blob_path = implode( '/', array_map( 'rawurlencode', explode( '/', $blob_name ) ) );
+            $blob_url  = "{$container_base_url}/{$blob_path}?{$sas_token}";
 
             $mime_type = 'application/octet-stream';
             if ( function_exists( 'mime_content_type' ) ) {
