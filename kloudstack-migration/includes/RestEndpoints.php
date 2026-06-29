@@ -384,7 +384,7 @@ class KloudStack_Migration_RestEndpoints {
             }
             ignore_user_abort( true );
             set_time_limit( 600 ); // Allow up to 10 min (large DB dump + upload combined)
-            KloudStack_Migration_BackgroundExport::process_queue();
+            KloudStack_Migration_BackgroundExport::drain_queue( 550 );
         } );
 
         // Also schedule via WP-Cron as a belt-and-suspenders fallback
@@ -558,7 +558,7 @@ class KloudStack_Migration_RestEndpoints {
             }
             ignore_user_abort( true );
             set_time_limit( 300 );
-            KloudStack_Migration_BackgroundExport::process_queue();
+            KloudStack_Migration_BackgroundExport::drain_queue( 250 );
         } );
 
         if ( ! wp_next_scheduled( KloudStack_Migration_BackgroundExport::CRON_HOOK ) ) {
@@ -753,7 +753,7 @@ class KloudStack_Migration_RestEndpoints {
             }
             ignore_user_abort( true );
             set_time_limit( 600 );
-            KloudStack_Migration_BackgroundExport::process_queue();
+            KloudStack_Migration_BackgroundExport::drain_queue( 550 );
         } );
 
         if ( ! wp_next_scheduled( KloudStack_Migration_BackgroundExport::CRON_HOOK ) ) {
@@ -1026,7 +1026,7 @@ class KloudStack_Migration_RestEndpoints {
             }
             ignore_user_abort( true );
             set_time_limit( 600 );
-            KloudStack_Migration_BackgroundExport::process_queue();
+            KloudStack_Migration_BackgroundExport::drain_queue( 550 );
         } );
 
         return new WP_REST_Response( [

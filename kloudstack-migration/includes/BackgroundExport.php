@@ -261,6 +261,45 @@ class KloudStack_Migration_BackgroundExport {
         }
     }
 
+    /**
+     * Drain the queue by running process_queue() back-to-back until the queue is
+     * empty or the wall-clock budget is exhausted.
+     *
+     * process_queue() does ONE batch per job and returns, which — when invoked from
+     * the background shutdown runner (set_time_limit(600) after fastcgi_finish_request)
+     * — ends the long-lived background process after a single ~25 s batch and leaves
+     * the rest of the work waiting for the next WP-Cron tick / server nudge (~60-90 s
+     * apart). On a low-traffic source site that means large content streams crawl.
+     *
+     * Looping here keeps the SAME already-running background process busy for the full
+     * window, so a big plugins/media export drains in minutes instead of hours. Each
+     * inner batch still checkpoints, so a process killed early loses nothing.
+     *
+     * @param int $budget_seconds Stay safely under the runner's set_time_limit(600).
+     */
+    public static function drain_queue( int $budget_seconds = 550 ): void {
+        $start = microtime( true );
+        do {
+            self::process_queue();
+
+            // Read the queue straight from the DB (bypass per-process cache, same
+            // reasoning as process_queue) to see whether incomplete work remains.
+            global $wpdb;
+            $raw      = $wpdb->get_var( $wpdb->prepare(
+                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+                self::QUEUE_OPTION
+            ) );
+            $pending  = $raw ? maybe_unserialize( $raw ) : [];
+            $has_work = is_array( $pending ) && ! empty( $pending );
+
+            // Small pause between batches so we never hot-spin (e.g. if a job is
+            // momentarily between checkpoints) and to be gentle on the source DB.
+            if ( $has_work ) {
+                usleep( 250000 ); // 0.25 s
+            }
+        } while ( $has_work && ( microtime( true ) - $start ) < $budget_seconds );
+    }
+
     // ------------------------------------------------------------------
     // DB Export
     // ------------------------------------------------------------------
@@ -583,7 +622,13 @@ class KloudStack_Migration_BackgroundExport {
         // large library is never killed mid-batch before a checkpoint is written
         // (count-based batching alone can blow the time limit on slow uploads).
         $max_exec    = (int) ini_get( 'max_execution_time' );
-        $time_budget = $max_exec > 0 ? max( 10, (int) floor( $max_exec * 0.8 ) ) : 45;
+        // Cap each batch at ~25 s so we checkpoint frequently and yield well before
+        // any host execution limit. The background runner calls set_time_limit(600),
+        // which makes max_execution_time report 600 even on hosts that won't actually
+        // honour it — so an uncapped 0.8×600 budget would risk a mid-batch kill before
+        // a checkpoint. drain_queue() loops these short batches back-to-back to use the
+        // full background window.
+        $time_budget = $max_exec > 0 ? max( 10, min( 25, (int) floor( $max_exec * 0.8 ) ) ) : 25;
         $start_time  = microtime( true );
 
         foreach ( $all_files as $entry ) {
@@ -1072,7 +1117,13 @@ class KloudStack_Migration_BackgroundExport {
         // (the indefinite export_media stall). Yielding on time guarantees each
         // cron tick persists durable progress.
         $max_exec    = (int) ini_get( 'max_execution_time' );
-        $time_budget = $max_exec > 0 ? max( 10, (int) floor( $max_exec * 0.8 ) ) : 45;
+        // Cap each batch at ~25 s so we checkpoint frequently and yield well before
+        // any host execution limit. The background runner calls set_time_limit(600),
+        // which makes max_execution_time report 600 even on hosts that won't actually
+        // honour it — so an uncapped 0.8×600 budget would risk a mid-batch kill before
+        // a checkpoint. drain_queue() loops these short batches back-to-back to use the
+        // full background window.
+        $time_budget = $max_exec > 0 ? max( 10, min( 25, (int) floor( $max_exec * 0.8 ) ) ) : 25;
         $start_time  = microtime( true );
 
         foreach ( $all_files as $entry ) {

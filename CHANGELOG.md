@@ -2,6 +2,11 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.9.2] - 2026-06-29
+
+### Changed
+- **Much faster content/media export (drain-loop)**: the background runner now drains the whole queue back-to-back within its `set_time_limit(600)` window via the new `BackgroundExport::drain_queue()`, instead of doing a single ~25 s batch and exiting — which left the rest of the work waiting ~60–90 s for the next WP-Cron tick / server nudge. On a low-traffic source site that turns a multi-hour large-plugin export (e.g. `wpdatatables` + PhpSpreadsheet, hundreds of files) into minutes. The per-batch time budget is capped at ~25 s so each batch checkpoints frequently and yields well before any host execution limit, so a process killed early loses nothing.
+
 ## [1.9.1] - 2026-06-29
 
 ### Fixed
