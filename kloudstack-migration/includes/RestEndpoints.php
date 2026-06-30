@@ -93,6 +93,20 @@ class KloudStack_Migration_RestEndpoints {
             'permission_callback' => [ __CLASS__, 'verify_token' ],
         ] );
 
+        // Phase-1 server-side migration: worker-driven per-file export primitives.
+        // The worker fetches a manifest then PUTs each file itself — no plugin queue.
+        register_rest_route( $ns, '/content-manifest', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'content_manifest' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
+
+        register_rest_route( $ns, '/upload-file', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'upload_file' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
+
         register_rest_route( $ns, '/diagnostics', [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => [ __CLASS__, 'diagnostics' ],
@@ -766,6 +780,102 @@ class KloudStack_Migration_RestEndpoints {
     // ------------------------------------------------------------------
     // Endpoint: POST /media-files
     // ------------------------------------------------------------------
+
+    /**
+     * Phase-1 server-side migration helper: map a well-known artifact name to its
+     * absolute wp-content directory. Whitelist-only — prevents path traversal.
+     */
+    private static function _artifact_root( string $artifact ) {
+        $map = [
+            'plugins'    => WP_CONTENT_DIR . '/plugins',
+            'themes'     => WP_CONTENT_DIR . '/themes',
+            'mu-plugins' => WP_CONTENT_DIR . '/mu-plugins',
+            'uploads'    => WP_CONTENT_DIR . '/uploads',
+        ];
+        return $map[ $artifact ] ?? null;
+    }
+
+    /**
+     * POST /content-manifest — Phase-1 worker-driven export.
+     * Body: { artifact, offset?, limit? }. Returns a resumable manifest
+     * { files:[{path,size}], total, offset, returned, next_offset } so the KloudStack
+     * worker can drive per-file uploads itself — no plugin queue / WP-Cron / drain-loop.
+     */
+    public static function content_manifest( WP_REST_Request $request ): WP_REST_Response {
+        $params   = $request->get_json_params() ?: [];
+        $artifact = sanitize_key( (string) ( $params['artifact'] ?? '' ) );
+        $offset   = max( 0, (int) ( $params['offset'] ?? 0 ) );
+        $limit    = (int) ( $params['limit'] ?? 0 );
+        if ( $limit <= 0 || $limit > 50000 ) {
+            $limit = 20000;
+        }
+
+        $root = self::_artifact_root( $artifact );
+        if ( $root === null ) {
+            return new WP_REST_Response( [ 'error' => 'unknown artifact' ], 400 );
+        }
+        if ( ! is_dir( $root ) ) {
+            // Absent artifact dir (e.g. no mu-plugins) — an empty manifest is valid.
+            return new WP_REST_Response( [
+                'artifact' => $artifact, 'files' => [], 'total' => 0,
+                'offset' => 0, 'returned' => 0, 'next_offset' => null,
+            ], 200 );
+        }
+
+        $all      = [];
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $root, FilesystemIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+        $root_len = strlen( $root ) + 1;
+        foreach ( $iterator as $file ) {
+            if ( ! $file->isFile() ) {
+                continue;
+            }
+            $rel   = str_replace( DIRECTORY_SEPARATOR, '/', substr( $file->getPathname(), $root_len ) );
+            $all[] = [ 'path' => $rel, 'size' => (int) $file->getSize() ];
+        }
+        $total = count( $all );
+        $page  = array_slice( $all, $offset, $limit );
+
+        return new WP_REST_Response( [
+            'artifact'    => $artifact,
+            'files'       => $page,
+            'total'       => $total,
+            'offset'      => $offset,
+            'returned'    => count( $page ),
+            'next_offset' => ( $offset + $limit < $total ) ? $offset + $limit : null,
+        ], 200 );
+    }
+
+    /**
+     * POST /upload-file — Phase-1 worker-driven export.
+     * Body: { artifact, path, url } where `url` is the worker-built (already-encoded)
+     * blob PUT URL. Confines `path` to the artifact root (no traversal) and PUTs the
+     * file. Returns { ok, bytes } or { ok:false, error }.
+     */
+    public static function upload_file( WP_REST_Request $request ): WP_REST_Response {
+        $params   = $request->get_json_params() ?: [];
+        $artifact = sanitize_key( (string) ( $params['artifact'] ?? '' ) );
+        $rel      = (string) ( $params['path'] ?? '' );
+        $blob_url = (string) ( $params['url'] ?? '' );
+
+        $root = self::_artifact_root( $artifact );
+        if ( $root === null || $rel === '' || $blob_url === '' ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'artifact, path and url are required' ], 400 );
+        }
+
+        $root_real = realpath( $root );
+        $abs       = realpath( $root . '/' . ltrim( $rel, '/' ) );
+        if ( $abs === false || $root_real === false
+            || strpos( $abs, $root_real . DIRECTORY_SEPARATOR ) !== 0
+            || ! is_file( $abs ) ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'file not found or outside artifact root' ], 400 );
+        }
+
+        $result = KloudStack_Migration_BackgroundExport::upload_single_file( $abs, $blob_url );
+        return new WP_REST_Response( $result, ! empty( $result['ok'] ) ? 200 : 502 );
+    }
 
     /**
      * Return a paginated list of media file paths in wp-content/uploads.

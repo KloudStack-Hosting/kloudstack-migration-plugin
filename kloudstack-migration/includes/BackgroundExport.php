@@ -1241,6 +1241,36 @@ class KloudStack_Migration_BackgroundExport {
      * @param string $mime_type  MIME type for Content-Type header
      * @throws Exception on upload failure
      */
+    /**
+     * Phase-1 (server-side migration) thin upload primitive.
+     *
+     * PUT a single local file to a worker-supplied blob URL and return a result array.
+     * Unlike the queue/drain-loop path, this does NO batching, pacing, checkpointing or
+     * URL-construction — the KloudStack worker owns all of that (it builds the encoded
+     * blob URL, drives concurrency, and retries). This is just "given a local file and a
+     * destination URL, PUT it." See server/docs/SERVER_SIDE_MIGRATION_DESIGN.md.
+     *
+     * @return array{ok:bool, bytes?:int, error?:string}
+     */
+    public static function upload_single_file( string $local_path, string $blob_url ): array {
+        if ( ! is_file( $local_path ) ) {
+            return [ 'ok' => false, 'error' => 'file not found' ];
+        }
+        $mime = 'application/octet-stream';
+        if ( function_exists( 'mime_content_type' ) ) {
+            $detected = @mime_content_type( $local_path );
+            if ( $detected ) {
+                $mime = $detected;
+            }
+        }
+        try {
+            self::_upload_blob_put( $blob_url, $local_path, $mime );
+            return [ 'ok' => true, 'bytes' => (int) filesize( $local_path ) ];
+        } catch ( Exception $e ) {
+            return [ 'ok' => false, 'error' => substr( $e->getMessage(), 0, 300 ) ];
+        }
+    }
+
     private static function _upload_blob_put( string $sas_url, string $local_path, string $mime_type ): void {
         $file_size = filesize( $local_path );
         $fh        = fopen( $local_path, 'rb' );
