@@ -2,6 +2,15 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.10.0] - 2026-06-30
+
+### Added
+- **Thin worker-driven export primitives** (server-side migration, Phase 1): the KloudStack worker can now drive per-file content uploads itself instead of this plugin self-draining a WP-Cron queue.
+  - `POST /content-manifest` `{artifact, offset?, limit?}` → resumable `{files:[{path,size}], total, next_offset}`; whitelisted artifacts (plugins/themes/mu-plugins/uploads), no path traversal.
+  - `POST /upload-file` `{artifact, path, url}` → PUTs one file to a worker-supplied (already-encoded) blob URL; `path` is confined to the artifact root.
+  - `BackgroundExport::upload_single_file()` primitive wrapping the existing blob PUT.
+- **Backwards compatible:** the existing queue/drain export path is unchanged; the worker only uses these endpoints when its `MIGRATION_WORKER_DRIVEN_EXPORT` flag is on. Sites can run 1.10.0 with no behaviour change.
+
 ## [1.9.3] - 2026-06-29
 
 ### Fixed
