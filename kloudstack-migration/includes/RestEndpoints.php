@@ -107,6 +107,18 @@ class KloudStack_Migration_RestEndpoints {
             'permission_callback' => [ __CLASS__, 'verify_token' ],
         ] );
 
+        register_rest_route( $ns, '/content-folders', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'content_folders' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
+
+        register_rest_route( $ns, '/zip-folder', [
+            'methods'             => WP_REST_Server::CREATABLE,
+            'callback'            => [ __CLASS__, 'zip_folder' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
+
         register_rest_route( $ns, '/diagnostics', [
             'methods'             => WP_REST_Server::READABLE,
             'callback'            => [ __CLASS__, 'diagnostics' ],
@@ -874,6 +886,105 @@ class KloudStack_Migration_RestEndpoints {
         }
 
         $result = KloudStack_Migration_BackgroundExport::upload_single_file( $abs, $blob_url );
+        return new WP_REST_Response( $result, ! empty( $result['ok'] ) ? 200 : 502 );
+    }
+
+    /**
+     * POST /content-folders — worker-driven per-folder export (v1.11.0).
+     * Body: { artifact }. Returns the top-level layout of the artifact root:
+     * { folders:[name], loose_files:[{path,size}] }. The worker zips each folder
+     * (one PUT each) and bundles the loose files, instead of transferring thousands
+     * of individual files. Whitelisted artifacts only; no path traversal possible
+     * (we only ever return direct children of the artifact root).
+     */
+    public static function content_folders( WP_REST_Request $request ): WP_REST_Response {
+        $params   = $request->get_json_params() ?: [];
+        $artifact = sanitize_key( (string) ( $params['artifact'] ?? '' ) );
+
+        $root = self::_artifact_root( $artifact );
+        if ( $root === null ) {
+            return new WP_REST_Response( [ 'error' => 'unknown artifact' ], 400 );
+        }
+        if ( ! is_dir( $root ) ) {
+            // Absent artifact dir (e.g. no mu-plugins) — empty layout is valid.
+            return new WP_REST_Response( [
+                'artifact' => $artifact, 'folders' => [], 'loose_files' => [],
+                'folder_count' => 0, 'loose_count' => 0,
+            ], 200 );
+        }
+
+        $folders = [];
+        $loose   = [];
+        $dh      = opendir( $root );
+        if ( false !== $dh ) {
+            while ( false !== ( $entry = readdir( $dh ) ) ) {
+                if ( '.' === $entry || '..' === $entry ) {
+                    continue;
+                }
+                $full = $root . DIRECTORY_SEPARATOR . $entry;
+                if ( is_dir( $full ) ) {
+                    $folders[] = $entry;
+                } elseif ( is_file( $full ) ) {
+                    $loose[] = [ 'path' => $entry, 'size' => (int) filesize( $full ) ];
+                }
+            }
+            closedir( $dh );
+        }
+        sort( $folders );
+
+        return new WP_REST_Response( [
+            'artifact'     => $artifact,
+            'folders'      => $folders,
+            'loose_files'  => $loose,
+            'folder_count' => count( $folders ),
+            'loose_count'  => count( $loose ),
+        ], 200 );
+    }
+
+    /**
+     * POST /zip-folder — worker-driven per-folder export (v1.11.0).
+     * Body: { artifact, folder, url, loose? }. Zips one top-level folder of the
+     * artifact (or, when `loose` is true, only the artifact root's stray files) and
+     * PUTs the archive to the worker-supplied (already-built) blob URL. `folder` is
+     * confined to a single direct child of the artifact root (no traversal).
+     * Returns { ok, files, bytes } or { ok:false, error }.
+     */
+    public static function zip_folder( WP_REST_Request $request ): WP_REST_Response {
+        $params   = $request->get_json_params() ?: [];
+        $artifact = sanitize_key( (string) ( $params['artifact'] ?? '' ) );
+        $folder   = (string) ( $params['folder'] ?? '' );
+        $blob_url = (string) ( $params['url'] ?? '' );
+        $loose    = ! empty( $params['loose'] );
+
+        $root = self::_artifact_root( $artifact );
+        if ( $root === null || $blob_url === '' ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'artifact and url are required' ], 400 );
+        }
+        $root_real = realpath( $root );
+        if ( $root_real === false ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'artifact root not found' ], 400 );
+        }
+
+        if ( $loose ) {
+            $result = KloudStack_Migration_BackgroundExport::zip_path_to_blob( $root_real, $blob_url, true );
+            return new WP_REST_Response( $result, ! empty( $result['ok'] ) ? 200 : 502 );
+        }
+
+        // A folder name must be a single direct child — reject separators / traversal.
+        if ( $folder === ''
+            || strpos( $folder, '/' ) !== false
+            || strpos( $folder, '\\' ) !== false
+            || strpos( $folder, '..' ) !== false ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'folder must be a single top-level directory name' ], 400 );
+        }
+        $abs = realpath( $root_real . DIRECTORY_SEPARATOR . $folder );
+        if ( $abs === false
+            || strpos( $abs, $root_real . DIRECTORY_SEPARATOR ) !== 0
+            || ! is_dir( $abs ) ) {
+            return new WP_REST_Response( [ 'ok' => false, 'error' => 'folder not found or outside artifact root' ], 400 );
+        }
+
+        $result = KloudStack_Migration_BackgroundExport::zip_path_to_blob( $abs, $blob_url, false );
         return new WP_REST_Response( $result, ! empty( $result['ok'] ) ? 200 : 502 );
     }
 

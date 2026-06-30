@@ -2,6 +2,15 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.11.0] - 2026-06-30
+
+### Added
+- **Per-folder zip export** (worker-driven, server-side migration): the KloudStack worker can now transfer one bounded zip per plugin/theme folder instead of thousands of individual files. A normal WordPress site is thousands of files because plugins bundle vendor trees (e.g. `wpdatatables` ships PhpSpreadsheet) — collapsing each folder into a single STORE-mode (uncompressed, near-zero CPU) zip cuts a ~12,000-file export down to ~22 transfers, and lets the deploy side unzip locally instead of doing ~12,000 per-file blob GETs.
+  - `POST /content-folders` `{artifact}` → `{folders:[name], loose_files:[{path,size}]}` — the top-level layout of an artifact root (whitelisted: plugins/themes/mu-plugins/uploads).
+  - `POST /zip-folder` `{artifact, folder, url, loose?}` → zips one top-level folder (or, with `loose:true`, only the artifact root's stray files like `index.php`/`hello.php`) and PUTs the archive to the worker-supplied blob URL. `folder` is confined to a single direct child of the artifact root (no traversal).
+  - `BackgroundExport::zip_path_to_blob()` primitive: bounded per-folder zip build (no whole-site giant zip → no PHP execution-time/OOM risk) + blob PUT, reusing the existing streaming uploader.
+- **Backwards compatible:** the per-file (`/content-manifest` + `/upload-file`) and legacy queue/ZIP paths are unchanged; the worker only uses the new endpoints when on plugin ≥ 1.11.0 with `MIGRATION_WORKER_DRIVEN_EXPORT` on.
+
 ## [1.10.0] - 2026-06-30
 
 ### Added

@@ -1271,6 +1271,100 @@ class KloudStack_Migration_BackgroundExport {
         }
     }
 
+    /**
+     * Zip ONE directory (or only its top-level loose files) and upload the archive
+     * to a worker-supplied blob URL. The core primitive of the worker-driven
+     * per-folder export (v1.11.0): the worker transfers ~one zip per plugin/theme
+     * folder instead of thousands of individual files. This is the architectural
+     * sweet spot — bounded build (each folder is small, so no whole-site giant zip
+     * and no PHP execution-time/OOM risk), bounded transfer (one PUT per folder),
+     * and the deploy side unzips locally (avoiding thousands of per-file blob GETs).
+     *
+     * STORE mode (no compression) keeps CPU near-zero on shared hosting — the win is
+     * collapsing N file operations into 1, not shrinking bytes.
+     *
+     * @param string $abs_dir    Absolute path: the artifact subfolder, or the artifact root when $loose_only.
+     * @param string $blob_url   Worker-built SAS PUT URL for the destination .zip blob.
+     * @param bool   $loose_only When true, archive only the files directly in $abs_dir
+     *                           (skip sub-directories) — for the artifact root's stray
+     *                           files (index.php, hello.php, single-file plugins).
+     * @return array { ok, files, bytes } | { ok:false, error }
+     */
+    public static function zip_path_to_blob( string $abs_dir, string $blob_url, bool $loose_only = false ): array {
+        if ( ! is_dir( $abs_dir ) ) {
+            return [ 'ok' => false, 'error' => 'directory not found' ];
+        }
+        if ( ! class_exists( 'ZipArchive' ) ) {
+            return [ 'ok' => false, 'error' => 'PHP ZipArchive extension is not available' ];
+        }
+
+        $tmp_zip = tempnam( sys_get_temp_dir(), 'ks_fzip_' ) . '.zip';
+        try {
+            $zip = new ZipArchive();
+            if ( true !== $zip->open( $tmp_zip, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) {
+                return [ 'ok' => false, 'error' => "cannot create zip at {$tmp_zip}" ];
+            }
+
+            $count = 0;
+            if ( $loose_only ) {
+                // Top-level files only — no recursion into sub-directories.
+                $dh = opendir( $abs_dir );
+                if ( false !== $dh ) {
+                    while ( false !== ( $entry = readdir( $dh ) ) ) {
+                        if ( '.' === $entry || '..' === $entry ) {
+                            continue;
+                        }
+                        $full = $abs_dir . DIRECTORY_SEPARATOR . $entry;
+                        if ( is_file( $full ) ) {
+                            $zip->addFile( $full, $entry );
+                            if ( method_exists( $zip, 'setCompressionName' ) ) {
+                                $zip->setCompressionName( $entry, ZipArchive::CM_STORE );
+                            }
+                            $count++;
+                        }
+                    }
+                    closedir( $dh );
+                }
+            } else {
+                $base_len = strlen( $abs_dir ) + 1;
+                $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator( $abs_dir, FilesystemIterator::SKIP_DOTS ),
+                    RecursiveIteratorIterator::LEAVES_ONLY
+                );
+                foreach ( $iterator as $file ) {
+                    if ( ! $file->isFile() ) {
+                        continue;
+                    }
+                    $rel = str_replace( DIRECTORY_SEPARATOR, '/', substr( $file->getPathname(), $base_len ) );
+                    $zip->addFile( $file->getPathname(), $rel );
+                    if ( method_exists( $zip, 'setCompressionName' ) ) {
+                        $zip->setCompressionName( $rel, ZipArchive::CM_STORE );
+                    }
+                    $count++;
+                }
+            }
+
+            $zip->close();
+
+            if ( 0 === $count ) {
+                // Empty directory / no loose files — a valid no-op, not an error.
+                return [ 'ok' => true, 'files' => 0, 'bytes' => 0, 'empty' => true ];
+            }
+            if ( ! file_exists( $tmp_zip ) || 0 === filesize( $tmp_zip ) ) {
+                return [ 'ok' => false, 'error' => 'zip produced empty output' ];
+            }
+
+            self::_upload_blob_put( $blob_url, $tmp_zip, 'application/zip' );
+            return [ 'ok' => true, 'files' => $count, 'bytes' => (int) filesize( $tmp_zip ) ];
+        } catch ( Exception $e ) {
+            return [ 'ok' => false, 'error' => substr( $e->getMessage(), 0, 300 ) ];
+        } finally {
+            if ( file_exists( $tmp_zip ) ) {
+                unlink( $tmp_zip );
+            }
+        }
+    }
+
     private static function _upload_blob_put( string $sas_url, string $local_path, string $mime_type ): void {
         $file_size = filesize( $local_path );
         $fh        = fopen( $local_path, 'rb' );
