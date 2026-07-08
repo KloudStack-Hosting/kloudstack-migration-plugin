@@ -2,6 +2,19 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.12.0] - 2026-07-07
+
+### Added
+- **`GET /security-scan`** — a core + plugin tamper scan run on the source site, in PHP (no
+  WP-CLI/shell needed, works on managed hosts). Verifies WordPress core and each active plugin
+  against the official WordPress.org checksums (`api.wordpress.org` core checksums +
+  `downloads.wordpress.org/plugin-checksums`). Premium/custom plugins with no WP.org checksums are
+  reported as `unverifiable` (normal), never `tampered`. Returns a structured verdict
+  (`clean` / `needs_review` / `tampered`) + findings; the platform runs this during Analysis and
+  surfaces it in the migration report, so a compromised source is flagged **before** cutover.
+  Token-authed like every other endpoint; bounded (caps on plugins/files scanned) and
+  `set_time_limit(0)` so a large site can't half-run.
+
 ## [1.11.0] - 2026-06-30
 
 ### Added

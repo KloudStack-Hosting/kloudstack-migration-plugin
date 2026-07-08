@@ -10,6 +10,7 @@
  *   GET  /job-status/{id}    — poll job status and progress percentage
  *   POST /upload-media       — start async media ZIP upload to Azure Blob (SAS URL provided)
  *   POST /media-files        — paginated list of media file paths (for incremental upload)
+ *   GET  /security-scan      — core + plugin checksum (tamper) scan against WordPress.org
  *
  * Authentication:
  *   All endpoints require the X-KloudStack-Token header matching the stored plugin token.
@@ -125,6 +126,12 @@ class KloudStack_Migration_RestEndpoints {
             'permission_callback' => [ __CLASS__, 'verify_token' ],
         ] );
 
+        register_rest_route( $ns, '/security-scan', [
+            'methods'             => WP_REST_Server::READABLE,
+            'callback'            => [ __CLASS__, 'security_scan' ],
+            'permission_callback' => [ __CLASS__, 'verify_token' ],
+        ] );
+
         register_rest_route( $ns, '/process-queue', [
             'methods'             => WP_REST_Server::CREATABLE,
             'callback'            => [ __CLASS__, 'process_queue_trigger' ],
@@ -190,6 +197,22 @@ class KloudStack_Migration_RestEndpoints {
         }
 
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Endpoint: GET /security-scan
+    // ------------------------------------------------------------------
+
+    /**
+     * Run a core + plugin checksum (tamper) scan on this source site and return
+     * the structured findings. See KloudStack_Migration_SecurityScan.
+     *
+     * @param WP_REST_Request $request
+     * @return WP_REST_Response
+     */
+    public static function security_scan( WP_REST_Request $request ): WP_REST_Response {
+        $scan = KloudStack_Migration_SecurityScan::run();
+        return new WP_REST_Response( $scan, 200 );
     }
 
     // ------------------------------------------------------------------
