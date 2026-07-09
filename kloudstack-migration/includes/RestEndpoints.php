@@ -356,7 +356,44 @@ class KloudStack_Migration_RestEndpoints {
             'disk_free_mb'           => ( disk_free_space( ABSPATH ) !== false ) ? round( disk_free_space( ABSPATH ) / 1024 / 1024, 1 ) : null,
             // WP7+ ships with native MCP support — agent uses this to skip /discover for WP7 sites.
             'mcp_native'             => version_compare( $wp_version, '7.0', '>=' ),
+            // Site-health-grade extras — the same data WP's Site Health surfaces, pulled directly.
+            // High signal for migration: drop-ins (cache/db drop-ins that reference the OLD host and
+            // break after cutover), mu-plugins (host platform code), PHP extensions, server info.
+            'site_health'            => self::_site_health_extras(),
         ], 200 );
+    }
+
+    /**
+     * Migration-relevant "Site Health" data, pulled via direct WP calls (cleaner and more
+     * reliable than parsing wp_debug_information()'s localized blob). Bounded + structured.
+     */
+    private static function _site_health_extras(): array {
+        if ( ! function_exists( 'get_dropins' ) || ! function_exists( 'get_mu_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        // Drop-ins: object-cache.php / advanced-cache.php / db.php etc. — these reference the
+        // source host's cache/DB config and are a leading cause of broken-after-migration sites.
+        $dropins    = array_values( array_keys( get_dropins() ) );
+        $mu_plugins = array_values( array_keys( get_mu_plugins() ) );
+
+        // Only the extensions that matter for export/import/media compatibility.
+        $relevant = [ 'curl', 'imagick', 'gd', 'mysqli', 'zip', 'mbstring', 'openssl', 'intl', 'exif', 'bcmath' ];
+        $loaded   = array_map( 'strtolower', get_loaded_extensions() );
+        $php_extensions = array_values( array_intersect( $relevant, $loaded ) );
+
+        $server_software = isset( $_SERVER['SERVER_SOFTWARE'] )
+            ? sanitize_text_field( wp_unslash( $_SERVER['SERVER_SOFTWARE'] ) )
+            : '';
+
+        return [
+            'dropins'             => $dropins,
+            'mu_plugins'          => $mu_plugins,
+            'php_extensions'      => $php_extensions,
+            'server_software'     => $server_software,
+            'permalink_structure' => (string) get_option( 'permalink_structure', '' ),
+            'https'               => ( strpos( (string) get_home_url(), 'https://' ) === 0 ),
+            'object_cache'        => (bool) wp_using_ext_object_cache(),
+        ];
     }
 
     // ------------------------------------------------------------------

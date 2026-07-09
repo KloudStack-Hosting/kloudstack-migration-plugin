@@ -2,6 +2,16 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.12.2] - 2026-07-09
+
+### Added
+- **Site-health extras in `/discover`.** A `site_health` block with migration-critical data pulled
+  directly (the same signals WP's Site Health surfaces): **drop-ins** (`object-cache.php` /
+  `advanced-cache.php` / `db.php` — these reference the source host's cache/DB config and are a
+  leading cause of broken-after-migration sites), **mu-plugins** (host platform code), relevant
+  **PHP extensions** (curl/imagick/gd/mysqli/zip/…), **server software**, permalink structure,
+  HTTPS, and external-object-cache status. Feeds the migration risk analysis + diagnostic agent.
+
 ## [1.12.1] - 2026-07-09
 
 ### Added
