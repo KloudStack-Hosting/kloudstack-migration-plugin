@@ -2,6 +2,16 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.12.1] - 2026-07-09
+
+### Changed
+- **Security scan: don't cry wolf on managed hosts.** GoDaddy / WP Engine / Kinsta patch core
+  files (post/query/meta) for their platform and delete `license.txt` / `readme.html` /
+  `wp-config-sample.php` — the v1.12.0 scan flagged all of that as `tampered`. Now only an
+  **unexpected file inside a core directory** (a file that shouldn't be there → likely backdoor)
+  is `tampered`; modified core, mismatched plugin files, and missing core files are `needs_review`
+  with a "common on managed hosts, usually benign" note; the routinely-deleted files are ignored.
+
 ## [1.12.0] - 2026-07-07
 
 ### Added

@@ -33,6 +33,9 @@ class KloudStack_Migration_SecurityScan {
     const MAX_UNEXPECTED      = 50;   // cap on reported unexpected core files
     const MAX_MISMATCHED      = 100;  // cap on reported plugin mismatches
 
+    /** Core files hosts / security hardening routinely delete — absence is noise, not a signal. */
+    const ROUTINELY_REMOVED   = [ 'license.txt', 'readme.html', 'wp-config-sample.php' ];
+
     /**
      * Run the scan and return the security_scan blob.
      *
@@ -84,7 +87,9 @@ class KloudStack_Migration_SecurityScan {
             $known[ $file ] = true;
             $path = ABSPATH . $file;
             if ( ! file_exists( $path ) ) {
-                $result['missing'][] = $file;
+                if ( ! in_array( $file, self::ROUTINELY_REMOVED, true ) ) {
+                    $result['missing'][] = $file;
+                }
             } elseif ( md5_file( $path ) !== $md5 ) {
                 $result['modified'][] = $file;
             }
@@ -223,10 +228,13 @@ class KloudStack_Migration_SecurityScan {
     // ------------------------------------------------------------------
 
     private static function compute_verdict( array $core, array $plugins ): string {
-        if ( ! empty( $core['unexpected'] ) || ! empty( $core['modified'] ) || ! empty( $plugins['mismatched'] ) ) {
+        // Only an UNEXPECTED file inside a core dir (a file that shouldn't be there) is a
+        // near-certain backdoor → tampered. Modified/mismatched/missing are commonly the
+        // host's own patches (GoDaddy, WP Engine, Kinsta) → needs_review, not alarm.
+        if ( ! empty( $core['unexpected'] ) ) {
             return 'tampered';
         }
-        if ( ! empty( $core['missing'] ) ) {
+        if ( ! empty( $core['modified'] ) || ! empty( $plugins['mismatched'] ) || ! empty( $core['missing'] ) ) {
             return 'needs_review';
         }
         return 'clean';
@@ -234,10 +242,12 @@ class KloudStack_Migration_SecurityScan {
 
     private static function summary( string $verdict, array $core, array $plugins ): string {
         if ( $verdict === 'tampered' ) {
+            return count( $core['unexpected'] ) . ' unexpected file(s) found inside WordPress core '
+                 . 'directories (files that should not be there) — a strong sign of a backdoor. '
+                 . 'Review before go-live.';
+        }
+        if ( $verdict === 'needs_review' ) {
             $bits = [];
-            if ( ! empty( $core['unexpected'] ) ) {
-                $bits[] = count( $core['unexpected'] ) . ' unexpected core file(s)';
-            }
             if ( ! empty( $core['modified'] ) ) {
                 $bits[] = count( $core['modified'] ) . ' modified core file(s)';
             }
@@ -246,12 +256,14 @@ class KloudStack_Migration_SecurityScan {
                     function ( $m ) { return $m['plugin']; },
                     $plugins['mismatched']
                 ) );
-                $bits[] = count( $names ) . ' plugin(s) with checksum mismatches';
+                $bits[] = count( $names ) . ' plugin(s) differing from WordPress.org';
             }
-            return 'Tamper indicators found: ' . implode( ', ', $bits ) . '. Recommend review before go-live.';
-        }
-        if ( $verdict === 'needs_review' ) {
-            return count( $core['missing'] ) . ' core file(s) missing — likely a deploy/host quirk, worth a quick check.';
+            if ( ! empty( $core['missing'] ) ) {
+                $bits[] = count( $core['missing'] ) . ' missing core file(s)';
+            }
+            return implode( ', ', $bits ) . ' differ from the official WordPress.org checksums. '
+                 . 'This is common on managed hosts (GoDaddy, WP Engine, Kinsta) that patch core '
+                 . 'for their platform, and is usually benign — worth a quick review.';
         }
         $note = '';
         if ( ! empty( $plugins['unverifiable'] ) ) {
