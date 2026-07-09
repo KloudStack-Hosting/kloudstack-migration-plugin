@@ -345,8 +345,11 @@ class KloudStack_Migration_RestEndpoints {
             'cron_next_scheduled'  => $cron_next_time ? (int) $cron_next_time : null,
             'jobs_in_queue'        => $jobs_in_queue,
             // Hosting environment — detected server-side so the migration agent has
-            // accurate context without guessing from URLs.
+            // accurate context without guessing from URLs. managed_host flags hosts that
+            // patch WP core (GoDaddy/WP Engine/Kinsta/…) so the security scan doesn't treat
+            // their expected core modifications as tampering.
             'hosting_platform'       => self::_detect_hosting_platform(),
+            'managed_host'           => self::_is_managed_host( self::_detect_hosting_platform() ),
             'exec_available'         => ( function_exists( 'exec' ) && ! in_array( 'exec', array_map( 'trim', explode( ',', ini_get( 'disable_functions' ) ) ), true ) ),
             'php_memory_limit_mb'    => self::_php_memory_limit_mb(),
             'php_max_execution_time' => (int) ini_get( 'max_execution_time' ),
@@ -1370,24 +1373,70 @@ class KloudStack_Migration_RestEndpoints {
         if ( getenv( 'WEBSITE_SITE_NAME' ) !== false ) {
             return 'azure_app_service';
         }
-        if ( defined( 'WPE_APIKEY' ) ) {
+        // WP Engine
+        if ( defined( 'WPE_APIKEY' ) || defined( 'PWP_NAME' ) || getenv( 'IS_WPE' ) !== false ) {
             return 'wpe';
         }
         if ( defined( 'WPCOM_IS_VIP_ENV' ) && WPCOM_IS_VIP_ENV ) {
             return 'wpvip';
         }
-        if ( getenv( 'KINSTA_CACHE_ZONE' ) !== false ) {
+        // Kinsta
+        if ( getenv( 'KINSTA_CACHE_ZONE' ) !== false || defined( 'KINSTAMU_VERSION' ) ) {
             return 'kinsta';
         }
-        // GoDaddy: cPanel hosting sets GD_PHP_HANDLER; some plans define GD_COMMAND_LINE;
-        // hostnames often contain 'secureserver.net' (GoDaddy's internal network domain).
+        // Pantheon
+        if ( getenv( 'PANTHEON_ENVIRONMENT' ) !== false ) {
+            return 'pantheon';
+        }
+        // Flywheel
+        if ( getenv( 'FLYWHEEL_CONFIG_DIR' ) !== false ) {
+            return 'flywheel';
+        }
+        // GoDaddy Managed WordPress (WPaaS) — the gd-system-plugin MU-plugin / WPaaS class /
+        // WPAAS constant, or the temporary *.myftpupload.com domain. This is a DIFFERENT
+        // product from GoDaddy cPanel (checked below) and is what the migration test site uses.
+        $host = defined( 'WPMU_PLUGIN_DIR' ) ? WPMU_PLUGIN_DIR : ( WP_CONTENT_DIR . '/mu-plugins' );
+        $home_host = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+        if ( defined( 'GD_SYSTEM_PLUGIN_DIR' )
+            || defined( 'WPAAS_PLUGIN_VERSION' )
+            || class_exists( '\\WPaaS\\Plugin' )
+            || file_exists( $host . '/gd-system-plugin.php' )
+            || is_dir( $host . '/gd-system-plugin' )
+            || strpos( $home_host, 'myftpupload.com' ) !== false
+            || strpos( $home_host, 'godaddysites.com' ) !== false
+        ) {
+            return 'godaddy';
+        }
+        // GoDaddy cPanel hosting: GD_PHP_HANDLER / GD_COMMAND_LINE; hostnames often contain
+        // 'secureserver.net' (GoDaddy's internal network domain).
         if ( getenv( 'GD_PHP_HANDLER' ) !== false
             || defined( 'GD_COMMAND_LINE' )
             || strpos( php_uname( 'n' ), 'secureserver' ) !== false
         ) {
             return 'godaddy';
         }
+        // SiteGround (SG Optimizer MU-plugin)
+        if ( file_exists( $host . '/sg-cachepress.php' ) || is_dir( $host . '/sg-cachepress' ) ) {
+            return 'siteground';
+        }
+        // Pressable / WordPress.com Atomic
+        if ( defined( 'IS_ATOMIC' ) && IS_ATOMIC ) {
+            return 'pressable';
+        }
         return 'other';
+    }
+
+    /**
+     * Whether the platform is a managed host that patches WP core / ships platform
+     * MU-plugins — on these, checksum-'modified' core files are EXPECTED, not tampering.
+     * Consumed by the security scan + migration report for managed-host-aware messaging.
+     */
+    private static function _is_managed_host( string $platform ): bool {
+        return in_array(
+            $platform,
+            [ 'wpe', 'kinsta', 'godaddy', 'wpvip', 'pantheon', 'flywheel', 'pressable', 'siteground' ],
+            true
+        );
     }
 
     /**

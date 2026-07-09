@@ -4,6 +4,13 @@ All notable changes to the KloudStack Migration Plugin will be documented here.
 
 ## [1.12.1] - 2026-07-09
 
+### Added
+- **Managed-host detection.** `/discover` now identifies **GoDaddy Managed WordPress** (WPaaS —
+  `gd-system-plugin` MU-plugin / `GD_SYSTEM_PLUGIN_DIR` / `*.myftpupload.com`), plus WP Engine,
+  Kinsta, Pantheon, Flywheel, SiteGround and Pressable — previously GoDaddy MWP reported
+  `hosting_platform: "other"`. Adds a `managed_host` boolean so the report and security scan can
+  treat these hosts' expected core patches as normal rather than tampering.
+
 ### Changed
 - **Security scan: don't cry wolf on managed hosts.** GoDaddy / WP Engine / Kinsta patch core
   files (post/query/meta) for their platform and delete `license.txt` / `readme.html` /
