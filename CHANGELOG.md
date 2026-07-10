@@ -2,6 +2,32 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.13.0] - 2026-07-10
+
+### Fixed
+- **`/diagnostics` reported a lock state it could never observe.** `lock_active` was read with
+  `get_transient('ks_mig_queue_lock')`, but `BackgroundExport::process_queue()` stores the
+  processing lock as a **raw `wp_options` row** (written with `INSERT IGNORE`, removed with
+  `$wpdb->delete`). The transient key `_transient_ks_mig_queue_lock` is never written by anything,
+  so `lock_active` was **structurally always `false`** — it could not report a running worker even
+  while one held the lock. KloudStack's poller used that flag as its "a worker is mid-batch, give it
+  time" guard, so the guard never fired and every stalled job was fast-failed with
+  *"queue is empty ... worker cannot recover without a restart."*
+- **`/diagnostics` read the queue through the object cache.** `queue_depth` used `get_option()`,
+  which answers from the per-process cache. On a multi-worker PHP-FPM host that cache reflects only
+  the current worker's writes — the very reason `process_queue()` has read the queue with a direct
+  `$wpdb` query since v1.7. Diagnostics now reads the DB too, so `queue_depth=0` means the queue is
+  empty rather than "this worker hasn't seen it yet".
+
+### Added
+- `queue_depth_cached` — the object-cache view alongside the DB truth, so a divergence is visible
+  instead of silently deciding the verdict.
+- `lock_stale` and `lock_age_seconds` — `process_queue()` force-claims a lock older than 600s, so a
+  stale lock is the one unambiguous signal that a worker was **killed before releasing it**. That is
+  the common failure on managed hosts (e.g. GoDaddy) which terminate PHP after
+  `fastcgi_finish_request()`, especially when WP-Cron is disabled and the job must drain in a single
+  shutdown call. We had no way to see it.
+
 ## [1.12.2] - 2026-07-09
 
 ### Added

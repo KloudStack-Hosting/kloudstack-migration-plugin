@@ -1107,9 +1107,44 @@ class KloudStack_Migration_RestEndpoints {
      * @return WP_REST_Response
      */
     public static function diagnostics( WP_REST_Request $request ): WP_REST_Response {
-        $queue      = get_option( KloudStack_Migration_BackgroundExport::QUEUE_OPTION, [] );
-        $lock_key   = 'ks_mig_queue_lock';
-        $lock_value = get_transient( $lock_key );
+        global $wpdb;
+
+        // Read the queue the way BackgroundExport::process_queue() does — straight from
+        // wp_options. get_option() answers from the per-process object cache, which on a
+        // multi-worker PHP-FPM host reflects only THIS worker's writes. process_queue()
+        // has bypassed it for exactly that reason; diagnostics never did, so it could report
+        // queue_depth=0 while the queue still held the job. That false zero is what the stall
+        // message ("queue is empty ... worker cannot recover") was built on.
+        $raw_queue = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            KloudStack_Migration_BackgroundExport::QUEUE_OPTION
+        ) );
+        $queue = $raw_queue ? maybe_unserialize( $raw_queue ) : [];
+        if ( ! is_array( $queue ) ) {
+            $queue = [];
+        }
+        // Keep the cached view as well, so a divergence is VISIBLE rather than silently
+        // deciding the verdict. cached != db means this worker's object cache is stale.
+        $cached_queue = get_option( KloudStack_Migration_BackgroundExport::QUEUE_OPTION, [] );
+        if ( ! is_array( $cached_queue ) ) {
+            $cached_queue = [];
+        }
+
+        // The processing lock is a RAW wp_options row: process_queue() writes it with
+        // INSERT IGNORE and removes it with $wpdb->delete. It is NOT a transient. Reading it
+        // with get_transient() looks for '_transient_ks_mig_queue_lock' — a key nothing ever
+        // writes — so lock_active was structurally ALWAYS false. It could not report a running
+        // worker even while one held the lock.
+        $lock_key = 'ks_mig_queue_lock';
+        $lock_ts  = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            $lock_key
+        ) );
+        $lock_age   = $lock_ts > 0 ? ( time() - $lock_ts ) : null;
+        // process_queue() force-claims a lock older than 600s, so only a fresh row means
+        // "a worker is running right now".
+        $lock_held  = ( $lock_ts > 0 && $lock_age < 600 );
+        $lock_stale = ( $lock_ts > 0 && $lock_age >= 600 );
 
         // Collect per-job status from transients so the agent can cross-reference
         // queue entries against their current transient state.
@@ -1139,12 +1174,18 @@ class KloudStack_Migration_RestEndpoints {
         $disable_fns = array_filter( array_map( 'trim', explode( ',', ini_get( 'disable_functions' ) ) ) );
 
         return new WP_REST_Response( [
-            // Queue state
+            // Queue state — read from the DB, not the object cache (see above).
             'queue_depth'          => count( $queue ),
+            'queue_depth_cached'   => count( $cached_queue ),   // divergence => stale worker cache
             'queue_jobs'           => $queue_jobs,
 
-            // Processing lock (TTL = 10 min; active means process_queue() is running)
-            'lock_active'          => ( false !== $lock_value ),
+            // Processing lock. A raw wp_options row, force-claimed after 600s by process_queue().
+            // lock_active means a worker is running RIGHT NOW; lock_stale means a worker was
+            // killed before it could release the lock — which is the signal we actually needed
+            // and never had.
+            'lock_active'          => $lock_held,
+            'lock_stale'           => $lock_stale,
+            'lock_age_seconds'     => $lock_age,
 
             // WP-Cron
             'wpcron_enabled'       => ! ( defined( 'DISABLE_WP_CRON' ) && DISABLE_WP_CRON ),
