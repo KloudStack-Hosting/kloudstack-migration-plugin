@@ -1509,21 +1509,43 @@ class KloudStack_Migration_BackgroundExport {
         ] );
     }
 
+    /**
+     * Current status of a job — read from the DB, then the cache.
+     *
+     * This decides DROP vs RE-QUEUE at the end of process_queue():
+     *
+     *     if ( $success )                              -> complete
+     *     elseif ( 'failed' !== self::_job_status() )  -> re-queue
+     *     // else: silently dropped
+     *
+     * It used to read get_transient() FIRST, i.e. the object cache — while the
+     * /job-status endpoint that KloudStack polls reads wp_options directly (it was moved to a
+     * direct read precisely because the cache lies across PHP-FPM workers). When the two
+     * disagreed, this method saw 'failed'/'complete' from a stale or foreign-worker cache and
+     * dropped the job, while the DB — and therefore KloudStack — kept reporting the last written
+     * progress forever. Symptom: queue empty, no lock, job frozen mid-percentage, and a poller
+     * that eventually gives up with "queue is empty ... worker cannot recover".
+     *
+     * The DB row is the single source of truth for job state. Read it the same way everywhere.
+     */
     private static function _job_status( string $job_id ): string {
         global $wpdb;
         $transient_key = KloudStack_Migration_RestEndpoints::JOB_TRANSIENT_PREFIX . $job_id;
-        $job           = get_transient( $transient_key );
-        if ( false === $job ) {
-            // Same shutdown-context fallback as _update_job.
-            $db_val = $wpdb->get_var( $wpdb->prepare(
-                "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
-                '_transient_' . $transient_key
-            ) );
-            if ( null === $db_val ) {
-                return 'unknown';
-            }
+
+        $db_val = $wpdb->get_var( $wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+            '_transient_' . $transient_key
+        ) );
+        if ( null !== $db_val ) {
             $job = maybe_unserialize( $db_val );
+            if ( is_array( $job ) ) {
+                return $job['status'] ?? 'unknown';
+            }
         }
+
+        // No shadow-write row (job predates it, or the write failed) — fall back to the cache
+        // rather than returning 'unknown' and re-queueing a job that is genuinely finished.
+        $job = get_transient( $transient_key );
         return is_array( $job ) ? ( $job['status'] ?? 'unknown' ) : 'unknown';
     }
 

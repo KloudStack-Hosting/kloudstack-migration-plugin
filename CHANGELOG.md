@@ -2,6 +2,26 @@
 
 All notable changes to the KloudStack Migration Plugin will be documented here.
 
+## [1.13.1] - 2026-07-10
+
+### Fixed
+- **`_job_status()` read the object cache to decide whether to drop a job from the queue.**
+  At the end of `process_queue()`:
+
+      if ( $success )                             -> mark complete
+      elseif ( 'failed' !== self::_job_status() ) -> re-queue
+      // else: dropped
+
+  `_job_status()` consulted `get_transient()` first — the per-worker object cache — while the
+  `/job-status` endpoint KloudStack polls reads `wp_options` directly (it was moved to a direct
+  read precisely because the cache lies across PHP-FPM workers). When the two disagreed, the job
+  was **silently dropped from the queue** while the DB kept reporting the last written progress
+  forever. Symptom: `queue_depth=0`, no lock row, job frozen mid-percentage, and the poller
+  eventually giving up with *"queue is empty ... worker cannot recover without a restart."*
+
+  `_job_status()` now reads the DB row first and falls back to the cache only when no shadow-write
+  row exists. The DB row is the single source of truth for job state — read the same way everywhere.
+
 ## [1.13.0] - 2026-07-10
 
 ### Fixed
